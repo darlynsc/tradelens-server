@@ -19,12 +19,20 @@ const SECRET_TOKEN = process.env.SECRET_TOKEN || 'MI_TOKEN_SECRETO';
 let accountData = null;
 let lastUpdate = null;
 let lastDealCount = 0;
+let lastBalance = 0;
+let lastPositionCount = 0;
 
 // ── SSE CLIENTS ───────────────────────────────────────────────────────────────
 const sseClients = new Set();
 
-function notifyClients() {
-  const msg = `data: ${JSON.stringify({ deals_count: lastDealCount, timestamp: lastUpdate })}\n\n`;
+function notifyClients(reason) {
+  const msg = `data: ${JSON.stringify({
+    deals_count: lastDealCount,
+    balance: lastBalance,
+    positions_count: lastPositionCount,
+    timestamp: lastUpdate,
+    reason: reason
+  })}\n\n`;
   for (const client of sseClients) {
     try { client.write(msg); } catch(_) { sseClients.delete(client); }
   }
@@ -36,16 +44,31 @@ app.post('/sync', (req, res) => {
   if (token !== SECRET_TOKEN) {
     return res.status(401).json({ error: 'Token inválido' });
   }
-  const newDealCount = req.body?.deals?.length || 0;
-  accountData = req.body;
-  lastUpdate = new Date().toISOString();
-  console.log(`✅ Sync recibido — ${new Date().toLocaleTimeString()} — Deals: ${newDealCount}`);
 
-  // Solo notificar al dashboard si cambió el número de deals
-  if (newDealCount !== lastDealCount) {
-    lastDealCount = newDealCount;
-    notifyClients();
-  }
+  const newDealCount     = req.body?.deals?.length || 0;
+  const newBalance       = req.body?.account?.balance || 0;
+  const newPositionCount = req.body?.positions?.length || 0;
+
+  accountData = req.body;
+  lastUpdate  = new Date().toISOString();
+
+  const dealChanged     = newDealCount     !== lastDealCount;
+  const balanceChanged  = Math.abs(newBalance - lastBalance) > 0.01;
+  const positionChanged = newPositionCount !== lastPositionCount;
+
+  let reason = 'sync';
+  if (balanceChanged)  reason = 'balance';
+  if (dealChanged)     reason = 'deal';
+  if (positionChanged) reason = newPositionCount < lastPositionCount ? 'cierre' : 'apertura';
+
+  console.log(`✅ Sync — ${new Date().toLocaleTimeString()} — Deals: ${newDealCount} | Balance: ${newBalance} | Pos: ${newPositionCount} | Motivo: ${reason}`);
+
+  lastDealCount     = newDealCount;
+  lastBalance       = newBalance;
+  lastPositionCount = newPositionCount;
+
+  // Notificar al dashboard SIEMPRE que el EA envíe datos
+  notifyClients(reason);
 
   res.json({ ok: true, timestamp: lastUpdate });
 });
@@ -75,7 +98,7 @@ app.get('/events', (req, res) => {
   res.flushHeaders();
 
   // Enviar estado inicial
-  res.write(`data: ${JSON.stringify({ deals_count: lastDealCount, timestamp: lastUpdate })}\n\n`);
+  res.write(`data: ${JSON.stringify({ deals_count: lastDealCount, balance: lastBalance, positions_count: lastPositionCount, timestamp: lastUpdate, reason: "init" })}\n\n`);
 
   sseClients.add(res);
   console.log(`📡 Dashboard conectado via SSE (${sseClients.size} clientes)`);
