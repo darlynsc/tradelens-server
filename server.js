@@ -13,8 +13,10 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const crypto = require('crypto');
 const path = require('path');
 const app = express();
+app.set('trust proxy', 1);
 
 app.use(cors({ methods: ['GET','POST','PUT','OPTIONS'] }));
 app.use(express.json({ limit: '5mb' }));
@@ -45,7 +47,7 @@ function notifyClients(reason) {
 // ── RECIBE DATOS DEL EA ───────────────────────────────────────────────────────
 app.post('/sync', (req, res) => {
   const token = req.headers['x-token'] || req.body?.token;
-  if (token !== SECRET_TOKEN) {
+  if (token !== SECRET_TOKEN) { // /sync solo lo acepta con el token maestro (la EA)
     return res.status(401).json({ error: 'Token inválido' });
   }
 
@@ -71,6 +73,9 @@ app.post('/sync', (req, res) => {
   lastBalance       = newBalance;
   lastPositionCount = newPositionCount;
 
+  // Guardar respaldo en la nube (cambios al instante; si no hay cambios, máximo cada 60 s)
+  persistSnapshot(reason);
+
   // Notificar al dashboard SIEMPRE que el EA envíe datos
   notifyClients(reason);
 
@@ -80,7 +85,7 @@ app.post('/sync', (req, res) => {
 // ── SIRVE DATOS AL DASHBOARD ──────────────────────────────────────────────────
 app.get('/data', (req, res) => {
   const token = req.query.token || req.headers['x-token'];
-  if (token !== SECRET_TOKEN) {
+  if (!isAuthorized(token)) {
     return res.status(401).json({ error: 'Token inválido' });
   }
   if (!accountData) {
@@ -92,7 +97,7 @@ app.get('/data', (req, res) => {
 // ── SSE — PUSH AL DASHBOARD CUANDO HAY CAMBIO ────────────────────────────────
 app.get('/events', (req, res) => {
   const token = req.query.token || req.headers['x-token'];
-  if (token !== SECRET_TOKEN) {
+  if (!isAuthorized(token)) {
     return res.status(401).json({ error: 'Token inválido' });
   }
 
@@ -133,9 +138,23 @@ if (DATABASE_URL) {
   const ready = pool.query(`CREATE TABLE IF NOT EXISTS tl_journal (
     day TEXT PRIMARY KEY, tag TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
     img TEXT NOT NULL DEFAULT '', saved TEXT NOT NULL DEFAULT '')`)
+    .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_kv (
+      k TEXT PRIMARY KEY, v TEXT NOT NULL, updated TEXT NOT NULL DEFAULT '')`))
     .then(() => console.log('🗄️  Journal: Postgres listo'))
     .catch(e => console.error('❌ Error preparando Postgres:', e.message));
   journalStore = {
+    async kvGet(k) {
+      await ready;
+      const { rows } = await pool.query('SELECT v FROM tl_kv WHERE k=$1', [k]);
+      return rows[0] ? JSON.parse(rows[0].v) : null;
+    },
+    async kvSet(k, v) {
+      await ready;
+      await pool.query(
+        `INSERT INTO tl_kv (k, v, updated) VALUES ($1,$2,$3)
+         ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated=EXCLUDED.updated`,
+        [k, JSON.stringify(v), new Date().toISOString()]);
+    },
     async all() {
       await ready;
       const { rows } = await pool.query('SELECT day, tag, note, img, saved FROM tl_journal');
@@ -160,6 +179,8 @@ if (DATABASE_URL) {
   try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) {}
   console.warn('⚠️  Journal: sin DATABASE_URL — se guarda en archivo (NO persistente en Render gratis)');
   journalStore = {
+    async kvGet(k) { try { return JSON.parse(fs.readFileSync(path.join(dir, 'kv_' + k + '.json'), 'utf8')); } catch (_) { return null; } },
+    async kvSet(k, v) { try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'kv_' + k + '.json'), JSON.stringify(v)); } catch (_) {} },
     async all() { return cache; },
     async put(day, e) {
       if (!cache[day] || (cache[day].saved || '') < e.saved) {
@@ -173,7 +194,7 @@ if (DATABASE_URL) {
 
 function checkToken(req, res) {
   const token = req.query.token || req.headers['x-token'];
-  if (token !== SECRET_TOKEN) { res.status(401).json({ error: 'Token inválido' }); return false; }
+  if (!isAuthorized(token)) { res.status(401).json({ error: 'Token inválido' }); return false; }
   return true;
 }
 
@@ -209,6 +230,131 @@ app.put('/journal/:day', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'Error guardando journal' }); }
 });
 
+
+// ── RESPALDO DE LOS DATOS DE LA EA ────────────────────────────────────────────
+// El último envío de la EA se guarda en la base de datos. Así el dashboard abre
+// con esos datos aunque la EA / la PC estén apagadas o el servidor se haya reiniciado.
+let lastSnapshotSave = 0;
+function persistSnapshot(reason) {
+  const now = Date.now();
+  if (reason === 'sync' && now - lastSnapshotSave < 60000) return;
+  lastSnapshotSave = now;
+  journalStore.kvSet('snapshot', { data: accountData, lastUpdate })
+    .catch(e => console.error('❌ No se pudo guardar el respaldo:', e.message));
+}
+
+// ── USUARIO Y CONTRASEÑA ──────────────────────────────────────────────────────
+// Un solo usuario. Contraseña guardada con scrypt (nunca en texto plano).
+// El SECRET_TOKEN de Render sirve como llave maestra: con él se crea o se restablece el usuario.
+const SESSION_SECRET = process.env.SESSION_SECRET || SECRET_TOKEN;
+let authCache = null; // { username, salt, hash, pv }
+
+function hashPw(pw, salt) { return crypto.scryptSync(String(pw), salt, 64).toString('hex'); }
+function checkPw(pw, a) {
+  const h = Buffer.from(hashPw(pw, a.salt), 'hex'), x = Buffer.from(a.hash, 'hex');
+  return h.length === x.length && crypto.timingSafeEqual(h, x);
+}
+function hmac(p) { return crypto.createHmac('sha256', SESSION_SECRET).update(p).digest('base64url'); }
+function signSession(a) {
+  const p = Buffer.from(JSON.stringify({ u: a.username, pv: a.pv, exp: Date.now() + 90 * 864e5 })).toString('base64url');
+  return 's1.' + p + '.' + hmac(p);
+}
+function verifySession(t) {
+  if (typeof t !== 'string' || !t.startsWith('s1.') || !authCache) return false;
+  const [, p, s] = t.split('.');
+  if (!p || !s) return false;
+  const a = Buffer.from(s), b = Buffer.from(hmac(p));
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  try {
+    const d = JSON.parse(Buffer.from(p, 'base64url').toString());
+    return d.pv === authCache.pv && d.u === authCache.username && d.exp > Date.now();
+  } catch (_) { return false; }
+}
+function isAuthorized(token) { return token === SECRET_TOKEN || verifySession(token); }
+
+// Freno a intentos fallidos (5 por IP cada 15 min)
+const attempts = new Map();
+function blocked(req) { const a = attempts.get(req.ip); return a && a.count >= 5 && a.until > Date.now(); }
+function fail(req) {
+  const a = attempts.get(req.ip) || { count: 0, until: 0 };
+  a.count = (a.until && a.until < Date.now()) ? 1 : a.count + 1;
+  a.until = Date.now() + 15 * 60000;
+  attempts.set(req.ip, a);
+}
+function okAttempt(req) { attempts.delete(req.ip); }
+
+async function saveAuth(username, password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  authCache = { username, salt, hash: hashPw(password, salt), pv: ((authCache && authCache.pv) || 0) + 1 };
+  await journalStore.kvSet('auth', authCache);
+  return signSession(authCache);
+}
+function validCreds(username, password) {
+  if (!/^[a-z0-9._@-]{3,40}$/.test(username)) return 'Usuario: 3 a 40 caracteres (letras, números, . _ - @).';
+  if (typeof password !== 'string' || password.length < 8 || password.length > 100) return 'La contraseña debe tener al menos 8 caracteres.';
+  return null;
+}
+
+app.get('/auth/status', (req, res) => res.json({ configured: !!authCache }));
+
+// Crear o restablecer usuario (requiere la llave maestra SECRET_TOKEN)
+app.post('/auth/setup', async (req, res) => {
+  if (blocked(req)) return res.status(429).json({ error: 'Demasiados intentos. Espera 15 minutos.' });
+  const { master, password } = req.body || {};
+  const username = String(req.body?.username || '').trim().toLowerCase();
+  if (master !== SECRET_TOKEN) { fail(req); return res.status(401).json({ error: 'Llave maestra incorrecta.' }); }
+  const bad = validCreds(username, password);
+  if (bad) return res.status(400).json({ error: bad });
+  try { const token = await saveAuth(username, password); okAttempt(req); res.json({ ok: true, token, username }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'No se pudo guardar el usuario.' }); }
+});
+
+app.post('/auth/login', (req, res) => {
+  if (blocked(req)) return res.status(429).json({ error: 'Demasiados intentos. Espera 15 minutos.' });
+  const username = String(req.body?.username || '').trim().toLowerCase();
+  const password = req.body?.password;
+  if (!authCache) return res.status(409).json({ error: 'Aún no hay usuario creado. Créalo en "Primera vez / recuperar acceso".' });
+  if (username !== authCache.username || typeof password !== 'string' || !checkPw(password, authCache)) {
+    fail(req); return res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+  }
+  okAttempt(req);
+  res.json({ ok: true, token: signSession(authCache), username: authCache.username });
+});
+
+// Cambiar usuario y/o contraseña (pide la contraseña actual). Cierra las sesiones viejas.
+app.post('/auth/change', async (req, res) => {
+  const token = req.query.token || req.headers['x-token'];
+  if (!isAuthorized(token)) return res.status(401).json({ error: 'Sesión inválida.' });
+  if (!authCache) return res.status(409).json({ error: 'No hay usuario creado.' });
+  if (blocked(req)) return res.status(429).json({ error: 'Demasiados intentos. Espera 15 minutos.' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (typeof currentPassword !== 'string' || !checkPw(currentPassword, authCache)) {
+    fail(req); return res.status(401).json({ error: 'La contraseña actual es incorrecta.' });
+  }
+  const username = String(req.body?.newUsername || authCache.username).trim().toLowerCase();
+  const password = newPassword ? newPassword : currentPassword;
+  const bad = validCreds(username, password);
+  if (bad) return res.status(400).json({ error: bad });
+  try { const t = await saveAuth(username, password); okAttempt(req); res.json({ ok: true, token: t, username }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'No se pudo guardar.' }); }
+});
+
+// Cargar usuario y último respaldo de la EA antes de recibir peticiones
+async function loadState() {
+  try {
+    authCache = await journalStore.kvGet('auth');
+    const snap = await journalStore.kvGet('snapshot');
+    if (snap && snap.data && !accountData) {
+      accountData = snap.data; lastUpdate = snap.lastUpdate;
+      lastDealCount = accountData.deals?.length || 0;
+      lastBalance = accountData.account?.balance || 0;
+      lastPositionCount = accountData.positions?.length || 0;
+      console.log(`📦 Respaldo cargado (${lastUpdate}) — Deals: ${lastDealCount}`);
+    }
+    console.log(authCache ? `👤 Usuario configurado: ${authCache.username}` : '👤 Sin usuario creado todavía');
+  } catch (e) { console.error('❌ Error cargando estado:', e.message); }
+}
+
 // ── STATUS ────────────────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   res.json({
@@ -234,4 +380,4 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 TradeLens Server corriendo en puerto ${PORT}`));
+loadState().finally(() => app.listen(PORT, () => console.log(`🚀 TradeLens Server corriendo en puerto ${PORT}`)));
