@@ -9,6 +9,8 @@
 // 5. Agrega variable de entorno: SECRET_TOKEN=tu_token_secreto
 // 6. (JOURNAL EN LA NUBE) Agrega variable de entorno: DATABASE_URL=<cadena de conexión Postgres>
 //    Sin DATABASE_URL el journal se guarda en un archivo local, que Render BORRA al reiniciar.
+//    Las capturas del journal también se guardan en esa base de datos (tabla tl_images):
+//    sin DATABASE_URL las imágenes NO son persistentes.
 
 const express = require('express');
 const cors = require('cors');
@@ -18,8 +20,8 @@ const path = require('path');
 const app = express();
 app.set('trust proxy', 1);
 
-app.use(cors({ methods: ['GET','POST','PUT','OPTIONS'] }));
-app.use(express.json({ limit: '5mb' }));
+app.use(cors({ methods: ['GET','POST','PUT','DELETE','OPTIONS'] }));
+app.use(express.json({ limit: '12mb' }));
 
 const SECRET_TOKEN = process.env.SECRET_TOKEN || 'MI_TOKEN_SECRETO';
 let accountData = null;
@@ -138,6 +140,11 @@ if (DATABASE_URL) {
   const ready = pool.query(`CREATE TABLE IF NOT EXISTS tl_journal (
     day TEXT PRIMARY KEY, tag TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
     img TEXT NOT NULL DEFAULT '', saved TEXT NOT NULL DEFAULT '')`)
+    .then(() => pool.query(`ALTER TABLE tl_journal ADD COLUMN IF NOT EXISTS imgs TEXT NOT NULL DEFAULT '[]'`))
+    .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_images (
+      id TEXT PRIMARY KEY, day TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '',
+      mime TEXT NOT NULL, size INTEGER NOT NULL, data BYTEA NOT NULL, created TEXT NOT NULL DEFAULT '')`))
+    .then(() => pool.query(`CREATE INDEX IF NOT EXISTS tl_images_day ON tl_images (day)`))
     .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_kv (
       k TEXT PRIMARY KEY, v TEXT NOT NULL, updated TEXT NOT NULL DEFAULT '')`))
     .then(() => console.log('🗄️  Journal: Postgres listo'))
@@ -157,20 +164,48 @@ if (DATABASE_URL) {
     },
     async all() {
       await ready;
-      const { rows } = await pool.query('SELECT day, tag, note, img, saved FROM tl_journal');
+      const { rows } = await pool.query('SELECT day, tag, note, img, imgs, saved FROM tl_journal');
+      const refs = {};
+      (await pool.query("SELECT id, ref FROM tl_images WHERE ref <> ''")).rows.forEach(r => { refs[r.id] = r.ref; });
       const out = {};
-      rows.forEach(r => { out[r.day] = { tag: r.tag, note: r.note, img: r.img, saved: r.saved }; });
+      rows.forEach(r => {
+        const imgs = parseImgs(r.imgs), imgRefs = {};
+        imgs.forEach(i => { if (refs[i]) imgRefs[i] = refs[i]; });
+        out[r.day] = { tag: r.tag, note: r.note, img: r.img, imgs, imgRefs, saved: r.saved };
+      });
       return out;
     },
     async put(day, e) {
       await ready;
       await pool.query(
-        `INSERT INTO tl_journal (day, tag, note, img, saved) VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (day) DO UPDATE SET tag=EXCLUDED.tag, note=EXCLUDED.note, img=EXCLUDED.img, saved=EXCLUDED.saved
-         WHERE tl_journal.saved < EXCLUDED.saved`, [day, e.tag, e.note, e.img, e.saved]);
-      const { rows } = await pool.query('SELECT tag, note, img, saved FROM tl_journal WHERE day=$1', [day]);
-      return rows[0];
-    }
+        `INSERT INTO tl_journal (day, tag, note, img, imgs, saved) VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (day) DO UPDATE SET tag=EXCLUDED.tag, note=EXCLUDED.note, img=EXCLUDED.img, imgs=EXCLUDED.imgs, saved=EXCLUDED.saved
+         WHERE tl_journal.saved < EXCLUDED.saved`, [day, e.tag, e.note, e.img, JSON.stringify(e.imgs || []), e.saved]);
+      const { rows } = await pool.query('SELECT tag, note, img, imgs, saved FROM tl_journal WHERE day=$1', [day]);
+      return rows[0] ? { ...rows[0], imgs: parseImgs(rows[0].imgs) } : rows[0];
+    },
+    // ── Imágenes (bytea en Postgres: persistente, sin credenciales extra) ──
+    async imgPut(id, day, ref, mime, buf) {
+      await ready;
+      await pool.query('INSERT INTO tl_images (id, day, ref, mime, size, data, created) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [id, day, ref, mime, buf.length, buf, new Date().toISOString()]);
+    },
+    async imgGet(id) {
+      await ready;
+      const { rows } = await pool.query('SELECT day, ref, mime, size, data FROM tl_images WHERE id=$1', [id]);
+      return rows[0] || null;
+    },
+    async imgDel(id, day) {
+      await ready;
+      const r = await pool.query('DELETE FROM tl_images WHERE id=$1 AND day=$2', [id, day]);
+      return r.rowCount > 0;
+    },
+    async imgCountDay(day) {
+      await ready;
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM tl_images WHERE day=$1', [day]);
+      return rows[0].n;
+    },
+    imgPersistent: true
   };
 } else {
   const dir = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -188,8 +223,41 @@ if (DATABASE_URL) {
         try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, JSON.stringify(cache)); } catch (_) {}
       }
       return cache[day];
-    }
+    },
+    // Imágenes en disco local: NO persistente en Render sin disco. Solo para pruebas locales.
+    async imgPut(id, day, ref, mime, buf) {
+      const d = path.join(dir, 'images'); fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, id + '.bin'), buf);
+      fs.writeFileSync(path.join(d, id + '.json'), JSON.stringify({ day, ref, mime, size: buf.length }));
+    },
+    async imgGet(id) {
+      try {
+        const d = path.join(dir, 'images');
+        const meta = JSON.parse(fs.readFileSync(path.join(d, id + '.json'), 'utf8'));
+        return { ...meta, data: fs.readFileSync(path.join(d, id + '.bin')) };
+      } catch (_) { return null; }
+    },
+    async imgDel(id, day) {
+      try {
+        const d = path.join(dir, 'images');
+        const meta = JSON.parse(fs.readFileSync(path.join(d, id + '.json'), 'utf8'));
+        if (meta.day !== day) return false;
+        fs.unlinkSync(path.join(d, id + '.bin')); fs.unlinkSync(path.join(d, id + '.json'));
+        return true;
+      } catch (_) { return false; }
+    },
+    async imgCountDay(day) {
+      try {
+        const d = path.join(dir, 'images');
+        return fs.readdirSync(d).filter(f => f.endsWith('.json') && JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')).day === day).length;
+      } catch (_) { return 0; }
+    },
+    imgPersistent: false
   };
+}
+function parseImgs(s) {
+  try { const a = typeof s === 'string' ? JSON.parse(s) : s; return Array.isArray(a) ? a.filter(x => /^[a-f0-9]{32}$/.test(x)).slice(0, 8) : []; }
+  catch (_) { return []; }
 }
 
 function checkToken(req, res) {
@@ -220,7 +288,8 @@ app.put('/journal/:day', async (req, res) => {
   const entry = {
     tag:   String(b.tag   || '').slice(0, 20),
     note:  String(b.note  || '').slice(0, 20000),
-    img:   String(b.img   || '').slice(0, 2000),
+    img:   String(b.img   || '').slice(0, 2000), // enlace antiguo (se conserva)
+    imgs:  parseImgs(b.imgs),                    // ids de imágenes subidas
     saved: String(b.saved || new Date().toISOString()).slice(0, 40)
   };
   try {
@@ -228,6 +297,70 @@ app.put('/journal/:day', async (req, res) => {
     notifyJournal(day);
     res.json({ ok: true, entry: current });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Error guardando journal' }); }
+});
+
+// ── IMÁGENES DEL JOURNAL ──────────────────────────────────────────────────────
+// Subida directa (cuerpo binario). Se guardan en la base de datos (persistente con DATABASE_URL).
+// Tipos permitidos verificados por firma del archivo (no por la extensión ni el Content-Type enviado).
+const IMG_MAX_BYTES = 5 * 1024 * 1024;
+const IMG_MAX_PER_DAY = 8;
+function sniffImage(b) {
+  if (b.length > 12 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image/jpeg';
+  if (b.length > 8 && b.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) return 'image/png';
+  if (b.length > 12 && b.slice(0, 4).toString('latin1') === 'RIFF' && b.slice(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+  if (b.length > 6 && (b.slice(0, 6).toString('latin1') === 'GIF87a' || b.slice(0, 6).toString('latin1') === 'GIF89a')) return 'image/gif';
+  return null;
+}
+const rawImage = express.raw({ type: () => true, limit: IMG_MAX_BYTES + 1024 });
+
+app.post('/journal/:day/images', (req, res, next) => {
+  if (!checkToken(req, res)) return;
+  next();
+}, rawImage, async (req, res) => {
+  const day = req.params.day;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: 'Fecha inválida' });
+  const buf = req.body;
+  if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ error: 'No se recibió ninguna imagen.' });
+  if (buf.length > IMG_MAX_BYTES) return res.status(413).json({ error: 'La imagen supera 5 MB.' });
+  const mime = sniffImage(buf);
+  if (!mime) return res.status(415).json({ error: 'Formato no permitido. Usa JPG, PNG, WEBP o GIF.' });
+  const ref = String(req.query.trade || '').replace(/[^0-9A-Za-z_-]/g, '').slice(0, 30);
+  try {
+    if ((await journalStore.imgCountDay(day)) >= IMG_MAX_PER_DAY) return res.status(409).json({ error: `Máximo ${IMG_MAX_PER_DAY} imágenes por día.` });
+    const id = crypto.randomBytes(16).toString('hex');
+    await journalStore.imgPut(id, day, ref, mime, buf);
+    res.json({ ok: true, id, mime, size: buf.length, ref, persistent: journalStore.imgPersistent });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'No se pudo guardar la imagen.' }); }
+});
+
+app.get('/images/:id', async (req, res) => {
+  if (!checkToken(req, res)) return;
+  const id = req.params.id;
+  if (!/^[a-f0-9]{32}$/.test(id)) return res.status(400).json({ error: 'Id inválido' });
+  try {
+    const im = await journalStore.imgGet(id);
+    if (!im) return res.status(404).json({ error: 'No encontrada' });
+    res.setHeader('Content-Type', im.mime);
+    res.setHeader('Content-Length', im.data.length);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    res.end(im.data);
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Error leyendo imagen' }); }
+});
+
+// Solo borra la imagen si pertenece a ese día (no toca archivos de otras entradas)
+app.delete('/journal/:day/images/:id', async (req, res) => {
+  if (!checkToken(req, res)) return;
+  const { day, id } = req.params;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !/^[a-f0-9]{32}$/.test(id)) return res.status(400).json({ error: 'Parámetros inválidos' });
+  try { res.json({ ok: true, deleted: await journalStore.imgDel(id, day) }); }
+  catch (e) { console.error(e); res.status(500).json({ error: 'Error borrando imagen' }); }
+});
+
+app.get('/journal-config', (req, res) => {
+  if (!checkToken(req, res)) return;
+  res.json({ images: true, persistent: !!journalStore.imgPersistent, maxBytes: IMG_MAX_BYTES, maxPerDay: IMG_MAX_PER_DAY });
 });
 
 
@@ -363,7 +496,9 @@ app.get('/status', (req, res) => {
     last_update: lastUpdate,
     deals_count: lastDealCount,
     positions_count: accountData?.positions?.length || 0,
-    sse_clients: sseClients.size
+    sse_clients: sseClients.size,
+    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent },
+    version: '1.2.0'
   });
 });
 
@@ -379,5 +514,6 @@ app.get('/', (req, res) => {
   `);
 });
 
+console.log(`🖼️  Imágenes del journal: rutas activas (${journalStore.imgPersistent ? 'persistentes en Postgres' : '⚠️ disco temporal, NO persistentes'})`);
 const PORT = process.env.PORT || 3000;
 loadState().finally(() => app.listen(PORT, () => console.log(`🚀 TradeLens Server corriendo en puerto ${PORT}`)));
