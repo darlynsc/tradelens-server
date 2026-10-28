@@ -29,6 +29,52 @@ let lastUpdate = null;
 let lastDealCount = 0;
 let lastBalance = 0;
 let lastPositionCount = 0;
+let lastSeq = null;      // último "seq" aceptado de la EA (orden de snapshots)
+
+// ── EXCURSIONES DE PRECIO (MAE/MFE en puntos) ─────────────────────────────────
+// La EA envía "price_exc" por posición. Aquí se valida, se conserva la unidad (puntos de SYMBOL_POINT) y la
+// calidad (cov), y se FUSIONA con lo ya guardado: una entrada solo se sustituye por otra con "rev" igual o mayor
+// (los reintentos no duplican; un estado atrasado no pisa uno más reciente; si la EA pierde su archivo local,
+// el servidor conserva las mediciones anteriores). Un valor desconocido NUNCA se convierte en 0: va como null.
+const PX_COV = new Set(['COMPLETE', 'PARTIAL', 'APPROXIMATE', 'UNAVAILABLE']);
+const PX_MAX_ENTRIES = 20000;
+const numOrNull = v => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+
+function cleanPriceExc(k, e) {
+  if (!/^\d{1,20}$/.test(k) || !e || typeof e !== 'object') return null;
+  if (e.side !== 0 && e.side !== 1) return null;
+  const p0 = numOrNull(e.p0), pt = numOrNull(e.pt), rev = numOrNull(e.rev);
+  if (!(p0 > 0) || !(pt > 0) || rev === null || rev < 0) return null;
+  let cov = String(e.cov);
+  if (!PX_COV.has(cov)) return null;
+  let mae = numOrNull(e.mae), mfe = numOrNull(e.mfe);
+  if (cov === 'UNAVAILABLE') { mae = null; mfe = null; }
+  else if (mae === null || mfe === null || mae < 0 || mfe < 0) { cov = 'UNAVAILABLE'; mae = null; mfe = null; } // contradictorio: no se acepta como medición
+  return {
+    sym: String(e.sym || '').slice(0, 40), side: e.side, p0, pt, tsz: numOrNull(e.tsz),
+    pmin: numOrNull(e.pmin), pmax: numOrNull(e.pmax), mae, mfe, unit: 'points', cov,
+    src: String(e.src || '').slice(0, 24), pend: e.pend === true, open: e.open === true, fin: e.fin === true,
+    late: e.late === true, t0: numOrNull(e.t0), tl: numOrNull(e.tl), vol: numOrNull(e.vol), rev
+  };
+}
+function mergePriceExc(incoming, previous) {
+  const merged = Object.assign({}, previous || {});
+  let ok = 0, bad = 0, older = 0;
+  if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+    for (const [k, e] of Object.entries(incoming)) {
+      const c = cleanPriceExc(k, e);
+      if (!c) { bad++; continue; }
+      if (merged[k] && merged[k].rev > c.rev) { older++; continue; }
+      merged[k] = c; ok++;
+    }
+  }
+  const keys = Object.keys(merged);
+  if (keys.length > PX_MAX_ENTRIES) {
+    keys.filter(k => merged[k].fin).sort((a, b) => (merged[a].t0 || 0) - (merged[b].t0 || 0))
+      .slice(0, keys.length - PX_MAX_ENTRIES).forEach(k => delete merged[k]);
+  }
+  return { merged, ok, bad, older };
+}
 
 // ── SSE CLIENTS ───────────────────────────────────────────────────────────────
 const sseClients = new Set();
@@ -51,6 +97,26 @@ app.post('/sync', (req, res) => {
   const token = req.headers['x-token'] || req.body?.token;
   if (token !== SECRET_TOKEN) { // /sync solo lo acepta con el token maestro (la EA)
     return res.status(401).json({ error: 'Token inválido' });
+  }
+
+  // Orden: un snapshot con "seq" menor que el último aceptado llegó tarde (reintento viejo) y no pisa el estado actual.
+  // Repetir el mismo seq es un reintento idempotente: el snapshot es el estado completo y simplemente lo reemplaza.
+  const inSeq = req.body?.seq;
+  if (typeof inSeq === 'number' && Number.isFinite(inSeq)) {
+    if (lastSeq !== null && inSeq < lastSeq) {
+      console.log(`⏭️  Sync descartado por antiguo (seq ${inSeq} < ${lastSeq})`);
+      return res.json({ ok: true, stale: true, timestamp: lastUpdate });
+    }
+    lastSeq = inSeq;
+  }
+  // price_exc: validar y fusionar (EA antigua sin este bloque: se conserva lo que ya había)
+  const hadPx = req.body && Object.prototype.hasOwnProperty.call(req.body, 'price_exc');
+  const prevPx = accountData && accountData.price_exc;
+  if (req.body && (hadPx || prevPx)) {
+    const r = mergePriceExc(hadPx ? req.body.price_exc : null, prevPx);
+    req.body.price_exc = r.merged;
+    req.body.price_exc_schema = 1;
+    if (r.bad || r.older) console.log(`ℹ️  price_exc: ${r.ok} aceptadas, ${r.bad} inválidas descartadas, ${r.older} antiguas ignoradas`);
   }
 
   const newDealCount     = req.body?.deals?.length || 0;
@@ -482,6 +548,7 @@ async function loadState() {
       lastDealCount = accountData.deals?.length || 0;
       lastBalance = accountData.account?.balance || 0;
       lastPositionCount = accountData.positions?.length || 0;
+      if (typeof accountData.seq === 'number' && Number.isFinite(accountData.seq)) lastSeq = accountData.seq;
       console.log(`📦 Respaldo cargado (${lastUpdate}) — Deals: ${lastDealCount}`);
     }
     console.log(authCache ? `👤 Usuario configurado: ${authCache.username}` : '👤 Sin usuario creado todavía');
@@ -497,8 +564,9 @@ app.get('/status', (req, res) => {
     deals_count: lastDealCount,
     positions_count: accountData?.positions?.length || 0,
     sse_clients: sseClients.size,
-    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent },
-    version: '1.2.0'
+    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true },
+    price_exc_count: accountData?.price_exc ? Object.keys(accountData.price_exc).length : 0,
+    version: '1.3.0'
   });
 });
 
