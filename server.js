@@ -147,6 +147,9 @@ app.post('/sync', (req, res) => {
   // Notificar al dashboard SIEMPRE que el EA envíe datos
   notifyClients(reason);
 
+  // Notificaciones push al teléfono (retiro, drawdown, Coach): se evalúan en el servidor, con la app cerrada
+  evaluatePush(reason).catch(e => console.error('❌ Push:', e && e.message));
+
   res.json({ ok: true, timestamp: lastUpdate });
 });
 
@@ -564,7 +567,7 @@ app.get('/status', (req, res) => {
     deals_count: lastDealCount,
     positions_count: accountData?.positions?.length || 0,
     sse_clients: sseClients.size,
-    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true },
+    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, push: !!(webpush && vapid), push_devices: pushState.subs.length },
     price_exc_count: accountData?.price_exc ? Object.keys(accountData.price_exc).length : 0,
     version: '1.3.0'
   });
@@ -582,6 +585,267 @@ app.get('/', (req, res) => {
   `);
 });
 
+// ── NOTIFICACIONES PUSH (Web Push) ────────────────────────────────────────────
+// El servidor decide cuándo avisar (en cada /sync de la EA) y envía el push al teléfono aunque la app esté cerrada.
+// Requiere: npm install web-push. Claves VAPID: variables VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY (recomendado);
+// si no existen se generan y se guardan en la base (tl_kv). Opcional: VAPID_SUBJECT (mailto:tu@correo.com).
+let webpush = null;
+try { webpush = require('web-push'); } catch (_) { console.warn('⚠️  Push desactivado: falta el paquete "web-push" (npm install web-push)'); }
+let pushState = { subs: [], cfg: null, sent: {} };
+let vapid = null;
+let _pushSaved = '';
+
+async function initPush() {
+  if (!webpush) return;
+  try {
+    const saved = await journalStore.kvGet('push');
+    if (saved && typeof saved === 'object') {
+      pushState = { subs: Array.isArray(saved.subs) ? saved.subs : [], cfg: saved.cfg || null, sent: saved.sent || {} };
+      _pushSaved = JSON.stringify(pushState);
+    }
+    let keys = (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY)
+      ? { publicKey: process.env.VAPID_PUBLIC_KEY.trim(), privateKey: process.env.VAPID_PRIVATE_KEY.trim() }
+      : await journalStore.kvGet('vapid');
+    if (!keys || !keys.publicKey || !keys.privateKey) {
+      keys = webpush.generateVAPIDKeys();
+      await journalStore.kvSet('vapid', keys);
+      console.warn('🔑 Claves VAPID generadas y guardadas en la base. Si cambian, los teléfonos deben reactivar las notificaciones.');
+    }
+    vapid = keys;
+    webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'https://tradelens-server.onrender.com', keys.publicKey, keys.privateKey);
+    console.log(`🔔 Push listo (${pushState.subs.length} dispositivo(s) suscrito(s))`);
+  } catch (e) { console.error('❌ Error iniciando push:', e.message); vapid = null; }
+}
+
+function savePush() {
+  const s = JSON.stringify(pushState);
+  if (s === _pushSaved) return;
+  _pushSaved = s;
+  journalStore.kvSet('push', pushState).catch(e => console.error('❌ No se pudo guardar push:', e.message));
+}
+
+app.get('/push/key', (req, res) => res.json({ enabled: !!(webpush && vapid), publicKey: vapid ? vapid.publicKey : null }));
+
+app.get('/push/status', (req, res) => {
+  if (!checkToken(req, res)) return;
+  res.json({ enabled: !!(webpush && vapid), devices: pushState.subs.length, hasConfig: !!pushState.cfg });
+});
+
+app.post('/push/subscribe', (req, res) => {
+  if (!checkToken(req, res)) return;
+  if (!webpush || !vapid) return res.status(503).json({ error: 'Push no disponible en el servidor (falta web-push).' });
+  const sub = req.body && req.body.subscription;
+  if (!sub || typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
+    return res.status(400).json({ error: 'Suscripción inválida.' });
+  }
+  const rec = { endpoint: sub.endpoint, keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) },
+    ua: String(req.headers['user-agent'] || '').slice(0, 160), created: new Date().toISOString() };
+  const prev = pushState.subs.find(x => x.endpoint === rec.endpoint);
+  if (prev) rec.created = prev.created || rec.created;
+  pushState.subs = pushState.subs.filter(x => x.endpoint !== rec.endpoint);
+  pushState.subs.push(rec);
+  if (pushState.subs.length > 10) pushState.subs = pushState.subs.slice(-10);
+  savePush();
+  res.json({ ok: true, devices: pushState.subs.length });
+});
+
+app.post('/push/unsubscribe', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const ep = req.body && req.body.endpoint;
+  if (typeof ep === 'string') { pushState.subs = pushState.subs.filter(x => x.endpoint !== ep); savePush(); }
+  res.json({ ok: true, devices: pushState.subs.length });
+});
+
+function cleanPushCfg(c) {
+  c = c && typeof c === 'object' ? c : {};
+  const n = (v, lo, hi, d) => { v = +v; return Number.isFinite(v) && v >= lo && v <= hi ? v : d; };
+  const w = c.wd && typeof c.wd === 'object' ? c.wd : {};
+  const nt = c.notify && typeof c.notify === 'object' ? c.notify : {};
+  const adj = w.adj && +w.adj.amt > 0 && Number.isFinite(+w.adj.base) ? { amt: +w.adj.amt, base: +w.adj.base } : null;
+  const g = Math.round(+w.goal);
+  return {
+    deposit: n(c.deposit, 0, 1e9, 0), threshold: n(c.threshold, 1, 1000, 25), riskPct: n(c.riskPct, 0.01, 100, 2.5),
+    ddLimitPct: n(c.ddLimitPct, 0.1, 100, 5),
+    notify: { wd: nt.wd !== false, dd: nt.dd !== false, coach: nt.coach !== false },
+    wd: {
+      mode: w.mode === 'recuperar' ? 'recuperar' : 'conservador', pct: n(w.pct, 5, 90, 40),
+      startNum: Math.round(n(w.startNum, 2, 7, 2)), goal: (g >= 2 && g <= 6) ? g : null,
+      claimed: Array.isArray(w.claimed) ? w.claimed.map(Number).filter(x => x >= 2 && x <= 6) : [],
+      cycleKey: String(w.cycleKey == null ? '' : w.cycleKey).slice(0, 40), adj
+    }
+  };
+}
+
+app.post('/push/config', (req, res) => {
+  if (!checkToken(req, res)) return;
+  pushState.cfg = cleanPushCfg(req.body);
+  savePush();
+  res.json({ ok: true });
+  evaluatePush('config').catch(e => console.error('❌ Push:', e && e.message));
+});
+
+app.post('/push/test', async (req, res) => {
+  if (!checkToken(req, res)) return;
+  if (!webpush || !vapid) return res.status(503).json({ error: 'Push no disponible en el servidor (falta web-push).' });
+  if (!pushState.subs.length) return res.status(409).json({ error: 'Este servidor no tiene ningún dispositivo suscrito.' });
+  const r = await sendPush([{ title: 'TradeLens — Prueba', body: 'Si ves esto, las notificaciones push funcionan aunque la app esté cerrada.', tag: 'tl-test', url: './index.html' }]);
+  res.json({ ok: r.sent > 0, ...r });
+});
+
+async function sendPush(items) {
+  if (!webpush || !vapid || !pushState.subs.length) return { sent: 0, failed: 0, removed: 0 };
+  let sent = 0, failed = 0; const dead = new Set();
+  for (const it of items) {
+    const payload = JSON.stringify(it);
+    await Promise.all(pushState.subs.map(async sub => {
+      try { await webpush.sendNotification(sub, payload, { TTL: 6 * 3600, urgency: 'high' }); sent++; }
+      catch (e) {
+        if (e && (e.statusCode === 404 || e.statusCode === 410)) dead.add(sub.endpoint);
+        else { failed++; console.error('❌ Push falló:', e && (e.statusCode || e.message)); }
+      }
+    }));
+  }
+  if (dead.size) { pushState.subs = pushState.subs.filter(x => !dead.has(x.endpoint)); savePush(); }
+  return { sent, failed, removed: dead.size };
+}
+
+// ── Cálculo (réplica de las funciones del dashboard) ──
+const PUSH_DAY_EPS = 5; // igual que DAY_EPS del dashboard: neto entre -5 y +5 = BreakEven
+const pDayClass = n => n > PUSH_DAY_EPS ? 'win' : n < -PUSH_DAY_EPS ? 'loss' : 'be';
+const pFmt = n => '$' + Number(n).toLocaleString('en', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+// Neto REALIZADO por día del bróker (profit+commission+swap de cada posición CERRADA, en el día de su último cierre)
+function pushDays(data) {
+  const deals = (data.deals || []).filter(d => d && d.entry !== 'BALANCE');
+  const open = new Set((data.positions || []).flatMap(p => [String(p.ticket), ...(p.position_id != null ? [String(p.position_id)] : [])]));
+  const pos = {};
+  for (const d of deals) (pos[d.position_id] = pos[d.position_id] || []).push(d);
+  const days = {};
+  for (const [pid, ds] of Object.entries(pos)) {
+    if (open.has(String(pid))) continue;
+    const exits = ds.filter(d => d.entry === 'OUT' || d.entry === 'INOUT');
+    if (!exits.length) continue;
+    const endT = Math.max(...exits.map(d => +d.time || 0));
+    const net = ds.reduce((a, d) => a + (+d.profit || 0) + (+d.commission || 0) + (+d.swap || 0), 0);
+    const date = new Date(endT * 1000).toISOString().slice(0, 10);
+    days[date] = +((days[date] || 0) + net).toFixed(2);
+  }
+  return days;
+}
+function pushStreak(list) { // list = [{date, net}] ordenada; devuelve la racha actual
+  let run = null;
+  for (const d of list) {
+    const type = pDayClass(d.net);
+    if (run && run.type === type && type !== 'be') { run.count++; run.net = +(run.net + d.net).toFixed(2); run.end = d.date; }
+    else run = { type, count: type === 'be' ? 0 : 1, net: type === 'be' ? 0 : d.net, start: d.date, end: d.date };
+  }
+  return run && run.type !== 'be' ? run : { type: 'none', count: 0, net: 0, start: null, end: null };
+}
+function pushDayStats(nets) {
+  const w = nets.filter(x => pDayClass(x) === 'win'), l = nets.filter(x => pDayClass(x) === 'loss');
+  const gw = w.reduce((a, b) => a + b, 0), gl = Math.abs(l.reduce((a, b) => a + b, 0));
+  return { N: nets.length, dec: w.length + l.length, exp: nets.length ? nets.reduce((a, b) => a + b, 0) / nets.length : 0, pf: gl > 0 ? gw / gl : null };
+}
+function wdBuildLevels(deposit, thr) { const f = 1 + thr / 100, out = []; let t = deposit; for (let i = 0; i < 6; i++) { out.push({ num: i + 1, target: +t.toFixed(2) }); t *= f; } return out; }
+function wdCurrentIdx(levels, bal) { for (let i = levels.length - 1; i >= 0; i--) if (bal >= levels[i].target) return i; return 0; }
+function wdCompute(levels, bal, st) {
+  const f = st.pct / 100;
+  const info = levels.map((l, i) => i === 0 ? null : { num: l.num, w: +((l.target - levels[i - 1].target) * f).toFixed(2), claimed: st.claimed.includes(l.num) });
+  const granted = []; let sum = 0;
+  if (st.mode === 'conservador') {
+    for (const x of info) {
+      if (!x || x.claimed || x.num < st.startNum) continue;
+      if (bal - (sum + x.w) >= levels[x.num - 1].target - 1e-6) { granted.push(x); sum += x.w; } else break;
+    }
+  }
+  return { granted, sum: +sum.toFixed(2) };
+}
+
+let _pushBusy = false;
+async function evaluatePush(reason) {
+  if (!webpush || !vapid || !pushState.subs.length || !accountData || _pushBusy) return;
+  _pushBusy = true;
+  try {
+    const cfg = pushState.cfg, S = pushState.sent, acc = accountData.account || {}, balance = +acc.balance || 0;
+    const nt = (cfg && cfg.notify) || { wd: true, dd: true, coach: true };
+    const off = Number.isFinite(+accountData.timestamp) && lastUpdate ? Math.round((accountData.timestamp * 1000 - Date.parse(lastUpdate)) / 900000) * 900000 : 0;
+    const today = new Date(Date.now() + off).toISOString().slice(0, 10); // día del servidor del bróker
+    const days = pushDays(accountData);
+    const out = [];
+
+    // 1) Retiro disponible / objetivo alcanzado (misma lógica que el Plan de Retiro)
+    if (cfg && nt.wd && cfg.deposit > 0 && balance > 0) {
+      const st = cfg.wd, levels = wdBuildLevels(cfg.deposit, cfg.threshold);
+      let eff = balance;
+      if (st.adj && Math.abs(balance - st.adj.base) < 0.005) eff = balance - st.adj.amt;
+      if (st.mode === 'conservador') {
+        const { granted, sum } = wdCompute(levels, eff, st);
+        if (granted.length) {
+          const sig = st.cycleKey + '#' + granted.map(x => x.num + ':' + x.w).join('|');
+          if (S.wdSig !== sig) { S.wdSig = sig; out.push({ title: 'TradeLens — Retiro disponible 💸', body: `¡Lograste el umbral de retiro! Ya puedes retirar ${pFmt(sum)} de tu cuenta.`, tag: 'tl-wd', url: './index.html#wdSection' }); }
+        }
+      } else {
+        const goal = st.goal || Math.min(6, Math.max(2, wdCurrentIdx(levels, balance) + 2));
+        const sig = st.cycleKey + '#' + goal;
+        if (balance >= levels[goal - 1].target && S.goalSig !== sig) { S.goalSig = sig; out.push({ title: 'TradeLens — Objetivo alcanzado 🎯', body: `Tu cuenta llegó al Nivel ${goal} (${pFmt(levels[goal - 1].target)}).`, tag: 'tl-wd', url: './index.html#wdSection' }); }
+      }
+    }
+
+    // 2) Drawdown diario superado (equity vs balance de inicio de día; mismo cálculo que el banner)
+    if (cfg && nt.dd && cfg.ddLimitPct > 0 && balance > 0) {
+      const realized = days[today] || 0, base = balance - realized, limit = base * cfg.ddLimitPct / 100;
+      const eq = acc.equity != null && Number.isFinite(+acc.equity) ? +acc.equity : null;
+      const used = eq != null ? Math.max(0, base - eq) : (realized < 0 ? -realized : 0);
+      if (base > 0 && used >= limit && S.ddDay !== today) {
+        S.ddDay = today;
+        out.push({ title: 'TradeLens — Drawdown diario superado ⚠️', body: `Pérdida de hoy: -${pFmt(used)} (${(used / base * 100).toFixed(2)}%). Tu límite es ${cfg.ddLimitPct}% = ${pFmt(limit)}.`, tag: 'tl-dd', url: './index.html' });
+      }
+    }
+
+    // 3) Coach: avisos de cambios importantes (subconjunto calculable en el servidor; solo con días ya cerrados)
+    if (nt.coach) {
+      const closed = Object.keys(days).filter(d => d < today).sort().map(d => ({ date: d, net: days[d] }));
+      const st = pushDayStats(closed.map(d => d.net));
+      const cur = pushStreak(closed);
+      const streakSig = (cur.type !== 'none' && cur.count >= 3) ? `${cur.type}${cur.count}@${cur.end}` : '';
+      const perf = (st.dec >= 5 ? ((st.pf != null && st.pf < 1 ? 1 : 0) | (st.exp < 0 ? 2 : 0)) : 0);
+      let lvl = null, lvlTarget = 0;
+      if (cfg && cfg.deposit > 0 && balance > 0) { lvl = 0; lvlTarget = cfg.deposit; const f = 1 + cfg.threshold / 100; while (balance >= lvlTarget * f && lvl < 50) { lvl++; lvlTarget *= f; } }
+      const cyc = cfg ? cfg.wd.cycleKey : '';
+      if (!S.coachInit) { // primera evaluación: se toma la foto actual sin avisar
+        S.coachInit = true; S.streakSig = streakSig; S.perf = perf; if (lvl != null) { S.lvlMax = lvl; S.lvlCycle = cyc; }
+      } else {
+        if (streakSig !== S.streakSig) {
+          if (streakSig) {
+            out.push(cur.type === 'loss'
+              ? { title: `Coach — Racha de ${cur.count} días perdedores ❄️`, body: `${cur.count} días operativos seguidos con neto negativo (${pFmt(cur.net)}). Revisa esos días en el journal antes de cambiar nada.`, tag: 'tl-coach-streak', url: './index.html#coachGrid' }
+              : { title: `Coach — Racha de ${cur.count} días ganadores 🔥`, body: `${cur.count} días operativos seguidos con neto positivo (${pFmt(cur.net)}). Mantén el plan y el mismo criterio de riesgo.`, tag: 'tl-coach-streak', url: './index.html#coachGrid' });
+          }
+          S.streakSig = streakSig;
+        }
+        if (perf !== (S.perf || 0)) {
+          const was = S.perf || 0;
+          if ((perf & 1) && !(was & 1)) out.push({ title: 'Coach — Profit Factor Diario < 1 ⚠️', body: `PF diario ${st.pf.toFixed(2)}: la suma de los días perdedores supera a la de los ganadores (${st.N} días).`, tag: 'tl-coach-pf', url: './index.html#coachGrid' });
+          if ((perf & 2) && !(was & 2)) out.push({ title: 'Coach — Expectancy Diaria Negativa ⚠️', body: `${pFmt(st.exp)} por día operado. Revisa si viene de pocos días de pérdida grande o de pérdidas pequeñas frecuentes.`, tag: 'tl-coach-exp', url: './index.html#coachGrid' });
+          if (was && !perf) out.push({ title: 'Coach — Métricas diarias recuperadas ✅', body: `PF diario${st.pf != null ? ' ' + st.pf.toFixed(2) : ''} y expectancy ${pFmt(st.exp)} por día operado.`, tag: 'tl-coach-pf', url: './index.html#coachGrid' });
+          S.perf = perf;
+        }
+        if (lvl != null) {
+          if (S.lvlCycle !== cyc) { S.lvlCycle = cyc; S.lvlMax = lvl; }
+          else if (S.lvlMax == null) S.lvlMax = lvl;
+          else if (lvl > S.lvlMax) {
+            S.lvlMax = lvl;
+            out.push({ title: `Coach — Nivel de Riesgo ${lvl + 1} 📊`, body: `Riesgo actual: ${pFmt(lvlTarget * cfg.riskPct / 100)}/trade (${cfg.riskPct}% de ${pFmt(lvlTarget)}).`, tag: 'tl-coach-lvl', url: './index.html#coachGrid' });
+          }
+        }
+      }
+    }
+
+    savePush();               // guarda lo "ya avisado" aunque no haya nada que enviar
+    if (out.length) { const r = await sendPush(out); console.log(`🔔 Push (${reason}): ${out.map(o => o.tag).join(', ')} → ${r.sent} enviado(s), ${r.failed} fallido(s)`); }
+  } finally { _pushBusy = false; }
+}
+
 console.log(`🖼️  Imágenes del journal: rutas activas (${journalStore.imgPersistent ? 'persistentes en Postgres' : '⚠️ disco temporal, NO persistentes'})`);
 const PORT = process.env.PORT || 3000;
-loadState().finally(() => app.listen(PORT, () => console.log(`🚀 TradeLens Server corriendo en puerto ${PORT}`)));
+loadState().then(initPush).catch(() => {}).finally(() => app.listen(PORT, () => console.log(`🚀 TradeLens Server corriendo en puerto ${PORT}`)));
