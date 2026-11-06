@@ -6,8 +6,12 @@
 // PRINCIPIOS
 //  · Los datos originales de MT5 (accountData) NUNCA se modifican: aquí solo se DERIVA una estructura aparte.
 //  · Determinista e idempotente: repetir el mismo snapshot produce exactamente el mismo resultado.
+//  · Solo participan en un ciclo las posiciones que ABARCAN MÁS DE UNA SESIÓN NY (abiertas en una sesión y todavía abiertas
+//    o cerradas en otra). Una posición que se abre y se cierra dentro de la misma sesión es INTRADÍA, aunque haya un swing
+//    abierto del mismo símbolo y dirección: no se incorpora al ciclo. Una posición abierta hoy sigue siendo intradía hasta que
+//    cruza el corte de las 17:00 NY.
 //  · Continuidad de un ciclo: mientras exista ≥1 posición del ciclo abierta, toda posición nueva del mismo
-//    símbolo y dirección se incorpora. Cuando todas quedan cerradas, el ciclo termina y no admite más.
+//    símbolo y dirección QUE ABARQUE MÁS DE UNA SESIÓN se incorpora. Cuando todas quedan cerradas, el ciclo termina y no admite más.
 //  · No se inventan relaciones: lo que no se puede verificar se marca (flags / ambigüedades), no se une.
 //  · Fechas = SESIÓN OPERATIVA DE NUEVA YORK: la sesión cambia a las 17:00 hora de Nueva York (con horario de verano
 //    de EE. UU.). Los deals llevan la hora del servidor del bróker codificada como epoch; se pasa a UTC restando el
@@ -107,10 +111,14 @@ function deriveRecord(rec, op) {
 }
 
 // ── 3) Barrido de eventos: aquí vive la regla de continuidad ──────────────────────────────────────────────
-function sweep(derived, state) {
+function sweep(derived, state, sk, nowDay) {
   const amb = [];
-  const chainable = derived.filter(r => r.sym && r.side && !r.noOpenDeal && r.openOrd);
-  const loose = derived.filter(r => !chainable.includes(r));
+  const hasOpen = r => r.sym && r.side && !r.noOpenDeal && r.openOrd;
+  // ¿La posición abarca más de una sesión NY? (cerrada: sesión de apertura ≠ sesión de cierre; abierta: ≠ sesión actual)
+  const spansSessions = r => sk(r.openOrd.t) !== (r.status === 'closed' ? sk(r.closeOrd.t) : nowDay);
+  // Posiciones que abren y cierran en la misma sesión (o abiertas hoy) = INTRADÍA: quedan fuera de los ciclos
+  const chainable = derived.filter(r => hasOpen(r) && spansSessions(r));
+  const loose = derived.filter(r => !hasOpen(r));
   const events = [];
   for (const r of chainable) {
     events.push({ kind: 'OPEN', ord: r.openOrd, r });
@@ -292,7 +300,7 @@ function update(prevState, snapshot, opts) {
   const nowDay = sk(nowT);
 
   const derived = Object.values(state.records).map(rec => deriveRecord(rec, openMap[rec.pid]));
-  const { cycles, amb } = sweep(derived, state);
+  const { cycles, amb } = sweep(derived, state, sk, nowDay);
   if (snapshot.deals_truncated === true)
     amb.push({ code: 'historial_truncado', pids: [], msg: 'La EA envía solo los deals más recientes: ciclos anteriores a esa ventana pueden estar incompletos. Los ya conocidos se conservan.' });
 
