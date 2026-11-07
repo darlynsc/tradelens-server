@@ -16,6 +16,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const path = require('path');
 const swingEngine = require('./swing-engine');   // ciclos SWING (módulo puro; subirlo junto a server.js)
 const app = express();
@@ -149,6 +150,7 @@ app.post('/sync', (req, res) => {
   accountData = req.body;
   lastUpdate  = new Date().toISOString();
   swingUpdate(accountData);   // deriva ciclos SWING del snapshot (no modifica accountData)
+  archiveDeals(accountData.deals);   // acumula deals nuevos en el archivo
 
   const dealChanged     = newDealCount     !== lastDealCount;
   const balanceChanged  = Math.abs(newBalance - lastBalance) > 0.01;
@@ -184,7 +186,16 @@ app.get('/data', (req, res) => {
   if (!accountData) {
     return res.status(404).json({ error: 'Sin datos aún. Asegúrate que el EA está corriendo.' });
   }
-  res.json({ ...accountData, swing: swingView, server_time: lastUpdate });
+  const payload = { ...accountData, deals: mergedDeals(), swing: swingView, server_time: lastUpdate };
+  if (!/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) return res.json(payload);
+  const key = lastUpdate + '|' + dealArchive.size + '|' + (swingView ? 1 : 0);
+  const send = buf => { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.setHeader('Content-Encoding', 'gzip'); res.setHeader('Vary', 'Accept-Encoding'); res.end(buf); };
+  if (dataGzCache.key === key && dataGzCache.buf) return send(dataGzCache.buf);
+  zlib.gzip(JSON.stringify(payload), (err, buf) => {
+    if (err) return res.json(payload);
+    dataGzCache = { key, buf };
+    send(buf);
+  });
 });
 
 // ── CICLOS SWING: consulta directa (ciclos, sesiones, ambigüedades) ────────────────────────────────────────
@@ -246,6 +257,8 @@ if (DATABASE_URL) {
     .then(() => pool.query(`CREATE INDEX IF NOT EXISTS tl_images_day ON tl_images (day)`))
     .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_kv (
       k TEXT PRIMARY KEY, v TEXT NOT NULL, updated TEXT NOT NULL DEFAULT '')`))
+    .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_deals (
+      ticket TEXT PRIMARY KEY, t BIGINT NOT NULL DEFAULT 0, d TEXT NOT NULL)`))
     .then(() => console.log('🗄️  Journal: Postgres listo'))
     .catch(e => console.error('❌ Error preparando Postgres:', e.message));
   journalStore = {
@@ -304,6 +317,21 @@ if (DATABASE_URL) {
       const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM tl_images WHERE day=$1', [day]);
       return rows[0].n;
     },
+    // ── Archivo de deals (historial acumulado; la EA solo envía los más recientes) ──
+    async dealsAll() {
+      await ready;
+      const { rows } = await pool.query('SELECT ticket, d FROM tl_deals');
+      return rows.map(r => [r.ticket, JSON.parse(r.d)]);
+    },
+    async dealsAdd(items) { // items: [[ticket, deal], ...] — solo inserta los que no existen
+      await ready;
+      for (let i = 0; i < items.length; i += 1000) {
+        const c = items.slice(i, i + 1000);
+        await pool.query(
+          `INSERT INTO tl_deals (ticket, t, d) SELECT * FROM unnest($1::text[], $2::bigint[], $3::text[]) ON CONFLICT (ticket) DO NOTHING`,
+          [c.map(x => x[0]), c.map(x => Math.round(+x[1].time) || 0), c.map(x => JSON.stringify(x[1]))]);
+      }
+    },
     imgPersistent: true
   };
 } else {
@@ -351,6 +379,12 @@ if (DATABASE_URL) {
         return fs.readdirSync(d).filter(f => f.endsWith('.json') && JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')).day === day).length;
       } catch (_) { return 0; }
     },
+    async dealsAll() { try { return JSON.parse(fs.readFileSync(path.join(dir, 'deals.json'), 'utf8')); } catch (_) { return []; } },
+    async dealsAdd(items) {
+      const cur = new Map(await this.dealsAll());
+      items.forEach(x => { if (!cur.has(x[0])) cur.set(x[0], x[1]); });
+      try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'deals.json'), JSON.stringify([...cur])); } catch (_) {}
+    },
     imgPersistent: false
   };
 }
@@ -358,6 +392,37 @@ function parseImgs(s) {
   try { const a = typeof s === 'string' ? JSON.parse(s) : s; return Array.isArray(a) ? a.filter(x => /^[a-f0-9]{32}$/.test(x)).slice(0, 8) : []; }
   catch (_) { return []; }
 }
+
+// ── ARCHIVO DE DEALS ──────────────────────────────────────────────────────────
+// La EA envía solo los deals más recientes. Aquí se acumulan (clave = ticket, inmutables) para no perder historial.
+// No modifica accountData ni el snapshot: solo se usa para completar la lista de deals que se sirve en /data.
+const dealArchive = new Map();
+let dealWriteChain = Promise.resolve();
+function archiveDeals(deals) {
+  try {
+    if (!Array.isArray(deals)) return;
+    const fresh = [];
+    for (const d of deals) {
+      if (!d || d.ticket == null) continue;
+      const k = String(d.ticket);
+      if (dealArchive.has(k)) continue;
+      dealArchive.set(k, d); fresh.push([k, d]);
+    }
+    if (!fresh.length) return;
+    dealWriteChain = dealWriteChain
+      .then(() => journalStore.dealsAdd(fresh))
+      .catch(e => { fresh.forEach(x => dealArchive.delete(x[0])); console.error('❌ No se pudo archivar deals (se reintentará):', e.message); });
+  } catch (e) { console.error('❌ Archivo de deals:', e.message); }
+}
+function mergedDeals() {
+  const snap = (accountData && accountData.deals) || [];
+  if (!dealArchive.size) return snap;
+  const m = new Map(dealArchive), extra = [];
+  for (const d of snap) { if (d && d.ticket != null) m.set(String(d.ticket), d); else extra.push(d); }
+  const n = v => { const x = +v; return Number.isFinite(x) ? x : 0; };
+  return [...m.values(), ...extra].sort((a, b) => (n(a.time) - n(b.time)) || (n(a.time_msc) - n(b.time_msc)) || (n(a.ticket) - n(b.ticket)));
+}
+let dataGzCache = { key: '', buf: null };
 
 function checkToken(req, res) {
   const token = req.query.token || req.headers['x-token'];
@@ -586,6 +651,9 @@ async function loadState() {
       if (typeof accountData.seq === 'number' && Number.isFinite(accountData.seq)) lastSeq = accountData.seq;
       console.log(`📦 Respaldo cargado (${lastUpdate}) — Deals: ${lastDealCount}`);
     }
+    try { (await journalStore.dealsAll()).forEach(x => dealArchive.set(x[0], x[1])); console.log(`🗃️  Archivo de deals: ${dealArchive.size}`); }
+    catch (e) { console.error('❌ Error cargando archivo de deals:', e.message); }
+    if (accountData) archiveDeals(accountData.deals);   // siembra el archivo con el último snapshot guardado
     // Estado SWING persistido: se recupera y se recalcula la vista con el último snapshot (mismos ids, mismas relaciones)
     swingState = await journalStore.kvGet('swing_state');
     if (accountData) { swingUpdate(accountData); }
