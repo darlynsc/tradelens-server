@@ -170,6 +170,7 @@ app.post('/sync', (req, res) => {
 
   // Notificar al dashboard SIEMPRE que el EA envíe datos
   notifyClients(reason);
+  pushEvaluate().catch(e => console.error('❌ Push:', e.message));   // avisos al teléfono (nunca bloquea /sync)
 
   res.json({ ok: true, timestamp: lastUpdate });
 });
@@ -593,6 +594,182 @@ async function loadState() {
   } catch (e) { console.error('❌ Error cargando estado:', e.message); }
 }
 
+// ── NOTIFICACIONES PUSH (Web Push: VAPID + cifrado aes128gcm; usa solo 'crypto' y 'fetch' de Node, sin paquetes nuevos) ──
+// El teléfono/PC se suscribe con /push/subscribe; el servidor evalúa cada /sync de la EA y envía el aviso aunque la app esté cerrada.
+// Las claves VAPID se generan una vez y se guardan junto con las suscripciones en la tabla kv ('push_state').
+const PUSH_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:tradelens@example.com';
+let pushState = null, pushLoading = null, pushSaveTimer = null;
+const pushNowUtc = () => Math.floor(Date.now() / 1000);
+
+async function pushEnsure() {
+  if (pushState) return pushState;
+  if (!pushLoading) pushLoading = (async () => {
+    let st = null;
+    try { st = await journalStore.kvGet('push_state'); } catch (_) {}
+    if (!st || !st.vapid || !st.vapid.publicKey || !st.vapid.privateJwk) {
+      const kp = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+      const jwk = kp.privateKey.export({ format: 'jwk' });
+      const pub = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]);
+      st = { vapid: { publicKey: pub.toString('base64url'), privateJwk: jwk }, subs: {}, cfg: {}, sent: {} };
+      try { await journalStore.kvSet('push_state', st); } catch (e) { console.error('❌ No se pudo guardar push_state:', e.message); }
+      console.log('🔔 Push: claves VAPID generadas');
+    }
+    st.subs = st.subs || {}; st.cfg = st.cfg || {}; st.sent = st.sent || {};
+    pushState = st;
+    return st;
+  })();
+  return pushLoading;
+}
+function pushSave() {
+  if (pushSaveTimer) return;
+  pushSaveTimer = setTimeout(() => {
+    pushSaveTimer = null;
+    journalStore.kvSet('push_state', pushState).catch(e => console.error('❌ No se pudo guardar push_state:', e.message));
+  }, 500);
+}
+const pushHmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
+// RFC 8291 (aes128gcm). opts.asPrivate / opts.salt solo para pruebas con el vector oficial.
+function pushEncrypt(sub, payload, opts) {
+  const ua = Buffer.from(sub.keys.p256dh, 'base64url'), auth = Buffer.from(sub.keys.auth, 'base64url');
+  const ecdh = crypto.createECDH('prime256v1');
+  if (opts && opts.asPrivate) ecdh.setPrivateKey(opts.asPrivate); else ecdh.generateKeys();
+  const asPub = ecdh.getPublicKey();
+  const secret = ecdh.computeSecret(ua);
+  const prkKey = pushHmac(auth, secret);
+  const ikm = pushHmac(prkKey, Buffer.concat([Buffer.from('WebPush: info\0'), ua, asPub, Buffer.from([1])]));
+  const salt = (opts && opts.salt) || crypto.randomBytes(16);
+  const prk = pushHmac(salt, ikm);
+  const cek = pushHmac(prk, Buffer.concat([Buffer.from('Content-Encoding: aes128gcm\0'), Buffer.from([1])])).subarray(0, 16);
+  const nonce = pushHmac(prk, Buffer.concat([Buffer.from('Content-Encoding: nonce\0'), Buffer.from([1])])).subarray(0, 12);
+  const cipher = crypto.createCipheriv('aes-128-gcm', cek, nonce);
+  const enc = Buffer.concat([cipher.update(Buffer.concat([payload, Buffer.from([2])])), cipher.final(), cipher.getAuthTag()]);
+  const rs = Buffer.alloc(4); rs.writeUInt32BE(4096);
+  return Buffer.concat([salt, rs, Buffer.from([asPub.length]), asPub, enc]);
+}
+function pushVapidJwt(audience) {
+  const head = Buffer.from(JSON.stringify({ typ: 'JWT', alg: 'ES256' })).toString('base64url');
+  const claims = Buffer.from(JSON.stringify({ aud: audience, exp: pushNowUtc() + 12 * 3600, sub: PUSH_SUBJECT })).toString('base64url');
+  const key = crypto.createPrivateKey({ key: pushState.vapid.privateJwk, format: 'jwk' });
+  const sig = crypto.sign('sha256', Buffer.from(head + '.' + claims), { key, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+  return head + '.' + claims + '.' + sig;
+}
+// Devuelve { status, text }. 404/410 = suscripción muerta.
+async function pushSendOne(sub, payloadObj) {
+  const body = pushEncrypt(sub, Buffer.from(JSON.stringify(payloadObj)));
+  const jwt = pushVapidJwt(new URL(sub.endpoint).origin);
+  const r = await fetch(sub.endpoint, {
+    method: 'POST',
+    headers: { Authorization: `vapid t=${jwt}, k=${pushState.vapid.publicKey}`, 'Content-Encoding': 'aes128gcm',
+      'Content-Type': 'application/octet-stream', TTL: '86400', Urgency: 'high' },
+    body, signal: AbortSignal.timeout(10000)
+  });
+  let text = ''; if (r.status >= 300) { try { text = (await r.text()).slice(0, 200); } catch (_) {} }
+  return { status: r.status, text };
+}
+// Envía a todos los dispositivos suscritos. Elimina los que ya no existen.
+async function pushBroadcast(payload) {
+  const st = await pushEnsure();
+  const res = { sent: 0, failed: 0, errors: [] };
+  for (const [ep, rec] of Object.entries(st.subs)) {
+    try {
+      const r = await pushSendOne(rec.sub, payload);
+      if (r.status >= 200 && r.status < 300) res.sent++;
+      else {
+        res.failed++; res.errors.push(`${r.status} ${r.text}`.trim());
+        if (r.status === 404 || r.status === 410) { delete st.subs[ep]; pushSave(); }
+      }
+    } catch (e) { res.failed++; res.errors.push(e.message); }
+  }
+  return res;
+}
+function pushAuth(req, res) {
+  const t = req.headers['x-token'] || req.query.token;
+  if (!isAuthorized(t)) { res.status(401).json({ error: 'Token inválido' }); return false; }
+  return true;
+}
+app.get('/push/key', async (req, res) => {
+  try { const st = await pushEnsure(); res.json({ enabled: true, publicKey: st.vapid.publicKey }); }
+  catch (e) { res.json({ enabled: false, error: e.message }); }
+});
+app.post('/push/subscribe', async (req, res) => {
+  if (!pushAuth(req, res)) return;
+  try {
+    const sub = req.body && req.body.subscription;
+    if (!sub || typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || !sub.keys || !sub.keys.p256dh || !sub.keys.auth)
+      return res.status(400).json({ error: 'Suscripción inválida.' });
+    const st = await pushEnsure();
+    st.subs[sub.endpoint] = { sub: { endpoint: sub.endpoint, keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) } }, added: new Date().toISOString() };
+    pushSave();
+    console.log(`🔔 Push: dispositivo suscrito (${Object.keys(st.subs).length} en total)`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/push/unsubscribe', async (req, res) => {
+  if (!pushAuth(req, res)) return;
+  try { const st = await pushEnsure(); if (req.body && req.body.endpoint) delete st.subs[req.body.endpoint]; pushSave(); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/push/config', async (req, res) => {
+  if (!pushAuth(req, res)) return;
+  try {
+    const st = await pushEnsure(), b = req.body || {}, num = (v, d) => (Number.isFinite(+v) ? +v : d);
+    st.cfg = { deposit: num(b.deposit, 0), threshold: num(b.threshold, 25), riskPct: num(b.riskPct, 2.5), ddLimitPct: num(b.ddLimitPct, 5),
+      notify: Object.assign({ wd: true, dd: true, coach: true }, b.notify || {}), wd: b.wd || null, updated: new Date().toISOString() };
+    pushSave(); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/push/test', async (req, res) => {
+  if (!pushAuth(req, res)) return;
+  try {
+    const st = await pushEnsure();
+    if (!Object.keys(st.subs).length) return res.json({ ok: false, error: 'Ningún dispositivo registrado. Desactiva y vuelve a activar las notificaciones.' });
+    const r = await pushBroadcast({ title: 'TradeLens', body: 'Notificación de prueba ✅ Todo funciona.', tag: 'tl-test' });
+    if (r.sent > 0) return res.json({ ok: true, sent: r.sent, failed: r.failed });
+    res.json({ ok: false, error: 'El servicio de notificaciones rechazó el envío: ' + (r.errors[0] || 'sin detalle') });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+
+// Pérdida del día vs límite de drawdown (misma fórmula que el dashboard). Un aviso por sesión NY.
+function pushTodayRealized(data) {
+  const off = (data.session && typeof data.session.broker_offset === 'number') ? data.session.broker_offset
+    : (swingView && typeof swingView.brokerOffset === 'number') ? swingView.brokerOffset : 0;
+  const open = new Set((data.positions || []).flatMap(p => [String(p.ticket), ...(p.position_id != null ? [String(p.position_id)] : [])]));
+  const by = {};
+  for (const d of (data.deals || [])) { if (!d || d.entry === 'BALANCE') continue; (by[d.position_id] = by[d.position_id] || []).push(d); }
+  const u = pushNowUtc(), today = new Date((u + swingEngine.nyOffsetSec(u) + 25200) * 1000).toISOString().slice(0, 10);
+  let realized = 0;
+  for (const [pid, ds] of Object.entries(by)) {
+    ds.sort((a, b) => a.time - b.time);
+    const exits = ds.filter(d => d.entry === 'OUT' || d.entry === 'INOUT');
+    if (!exits.length || open.has(String(pid))) continue;
+    if (swingEngine.sessionKey(exits[exits.length - 1].time, off) !== today) continue;
+    realized += ds.reduce((a, d) => a + (+d.profit || 0) + (+d.commission || 0) + (+d.swap || 0), 0);
+  }
+  return { today, realized };
+}
+async function pushEvaluate() {
+  const st = await pushEnsure();
+  if (!accountData || !Object.keys(st.subs).length) return;
+  const cfg = st.cfg || {}, notify = cfg.notify || { dd: true };
+  const acc = accountData.account || {};
+  if (notify.dd !== false && acc.balance) {
+    const { today, realized } = pushTodayRealized(accountData);
+    const limitPct = cfg.ddLimitPct > 0 ? cfg.ddLimitPct : 5;
+    const base = acc.balance - realized, limit = base * limitPct / 100;
+    const realLoss = realized < 0 ? -realized : 0;
+    const used = acc.equity != null ? Math.max(0, base - acc.equity) : realLoss;
+    const key = 'dd:' + today;
+    if (base > 0 && used >= limit && !st.sent[key]) {
+      st.sent[key] = Date.now();
+      for (const k of Object.keys(st.sent)) if (k.startsWith('dd:') && k !== key) delete st.sent[k];
+      pushSave();
+      const r = await pushBroadcast({ title: 'TradeLens — Drawdown diario superado ⚠️',
+        body: `Pérdida del día: -$${used.toFixed(2)} (${(used / base * 100).toFixed(2)}%) · Límite ${limitPct}% = $${limit.toFixed(2)}`, tag: 'tl-dd' });
+      console.log(`🔔 Push drawdown: enviados ${r.sent}, fallidos ${r.failed}`);
+    }
+  }
+}
+
 // ── STATUS ────────────────────────────────────────────────────────────────────
 app.get('/status', (req, res) => {
   res.json({
@@ -602,7 +779,7 @@ app.get('/status', (req, res) => {
     deals_count: lastDealCount,
     positions_count: accountData?.positions?.length || 0,
     sse_clients: sseClients.size,
-    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, swing_cycles: true },
+    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, swing_cycles: true, push: true },
     swing_cycles: swingView ? swingView.stats : null,
     price_exc_count: accountData?.price_exc ? Object.keys(accountData.price_exc).length : 0,
     version: '1.4.0'
