@@ -530,6 +530,104 @@ app.get('/journal-config', (req, res) => {
 });
 
 
+// ── CAPTURA DE GRÁFICOS DE MT5 (a pedido desde el Journal) ───────────────────
+// Flujo: el Journal pide una captura (/capture/request) → la EA la recoge consultando /capture/poll → hace ChartScreenShot
+// (calidad nativa de MT5) → la sube a /capture/upload, que la guarda y la agrega al journal del día → el Journal consulta /capture/status.
+// Para no mantener el servidor despierto sin motivo, la EA consulta cada 20 s y cada 1 s mientras el Journal esté "armado" (abierto o con una solicitud reciente).
+const capJobs = new Map();
+let capArmedUntil = 0, capLastPoll = 0;
+const CAP_TTL_MS = 60000;
+
+async function attachImageToEntry(day, imgId) {
+  const all = await journalStore.all();
+  const cur = all[day] || { tag: '', note: '', img: '', imgs: [] };
+  let saved = new Date().toISOString();
+  const prev = Date.parse(cur.saved || '');
+  if (Number.isFinite(prev) && prev >= Date.parse(saved)) saved = new Date(prev + 1).toISOString();
+  await journalStore.put(day, { tag: cur.tag || '', note: cur.note || '', img: cur.img || '', imgs: parseImgs([...(cur.imgs || []), imgId]), saved });
+}
+
+app.post('/capture/arm', (req, res) => {
+  if (!checkToken(req, res)) return;
+  capArmedUntil = Date.now() + 5 * 60000;
+  res.json({ ok: true });
+});
+
+app.post('/capture/request', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const b = req.body || {};
+  const day = String(b.day || '');
+  if (!JKEY_RE.test(day)) return res.status(400).json({ error: 'Fecha inválida' });
+  const ref = String(b.ref || '').replace(/[^0-9A-Za-z_-]/g, '').slice(0, 30);
+  const now = Date.now();
+  for (const [k, j] of capJobs) if (now - j.t > 10 * 60000) capJobs.delete(k);
+  const id = crypto.randomBytes(6).toString('hex');
+  capJobs.set(id, { id, day, ref, t: now, state: 'waiting', imgs: [], error: '' });
+  capArmedUntil = now + 5 * 60000;
+  res.json({ ok: true, id, eaSeen: now - capLastPoll < 60000 });
+});
+
+// La EA pregunta si hay una solicitud pendiente (entrega cada solicitud una sola vez)
+app.get('/capture/poll', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const now = Date.now();
+  capLastPoll = now;
+  let job = null;
+  for (const j of capJobs.values()) {
+    if (j.state !== 'waiting') continue;
+    if (now - j.t > CAP_TTL_MS) { j.state = 'failed'; j.error = 'Caducó: la EA no la recogió a tiempo.'; continue; }
+    job = j; break;
+  }
+  if (job) job.state = 'taken';
+  res.json({ job: job ? { id: job.id, day: job.day, ref: job.ref } : null, fast: !!job || now < capArmedUntil });
+});
+
+app.post('/capture/upload', (req, res, next) => {
+  if (!checkToken(req, res)) return;
+  next();
+}, rawImage, async (req, res) => {
+  const job = capJobs.get(String(req.query.id || ''));
+  if (!job || job.state !== 'taken') return res.status(404).json({ error: 'Solicitud de captura no encontrada o caducada.' });
+  const buf = req.body;
+  if (!Buffer.isBuffer(buf) || !buf.length) return res.status(400).json({ error: 'No se recibió ninguna imagen.' });
+  if (buf.length > IMG_MAX_BYTES) return res.status(413).json({ error: 'La imagen supera 5 MB.' });
+  const mime = sniffImage(buf);
+  if (!mime) return res.status(415).json({ error: 'Formato no permitido.' });
+  try {
+    if ((await journalStore.imgCountDay(job.day)) >= IMG_MAX_PER_DAY) return res.status(409).json({ error: `Máximo ${IMG_MAX_PER_DAY} imágenes por día.` });
+    const id = crypto.randomBytes(16).toString('hex');
+    await journalStore.imgPut(id, job.day, job.ref, mime, buf);
+    await attachImageToEntry(job.day, id);
+    job.imgs.push({ id, ref: job.ref });
+    notifyJournal(job.day);
+    res.json({ ok: true, id });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'No se pudo guardar la imagen.' }); }
+});
+
+app.post('/capture/done', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const j = capJobs.get(String((req.body || {}).id || ''));
+  if (j) { j.state = j.imgs.length ? 'done' : 'failed'; if (!j.imgs.length && !j.error) j.error = 'La EA no subió ninguna imagen.'; }
+  res.json({ ok: true });
+});
+
+app.post('/capture/fail', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const b = req.body || {};
+  const j = capJobs.get(String(b.id || ''));
+  if (j) { j.state = 'failed'; j.error = String(b.error || 'La EA no pudo capturar el gráfico.').slice(0, 300); }
+  res.json({ ok: true });
+});
+
+app.get('/capture/status', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const j = capJobs.get(String(req.query.id || ''));
+  if (!j) return res.status(404).json({ error: 'Solicitud no encontrada.' });
+  if (j.state === 'waiting' && Date.now() - j.t > CAP_TTL_MS) { j.state = 'failed'; j.error = 'La EA no respondió. Comprueba que MT5 esté abierto y la EA actualizada.'; }
+  res.json({ state: j.state, imgs: j.imgs, error: j.error });
+});
+
+
 // ── RESPALDO DE LOS DATOS DE LA EA ────────────────────────────────────────────
 // El último envío de la EA se guarda en la base de datos. Así el dashboard abre
 // con esos datos aunque la EA / la PC estén apagadas o el servidor se haya reiniciado.
@@ -847,7 +945,7 @@ app.get('/status', (req, res) => {
     deals_count: lastDealCount,
     positions_count: accountData?.positions?.length || 0,
     sse_clients: sseClients.size,
-    features: { journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, swing_cycles: true, push: true },
+    features: { mt5_capture: true, journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, swing_cycles: true, push: true },
     swing_cycles: swingView ? swingView.stats : null,
     price_exc_count: accountData?.price_exc ? Object.keys(accountData.price_exc).length : 0,
     version: '1.4.0'
