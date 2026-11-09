@@ -1,10 +1,12 @@
 {
   "name": "tradelens-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "TradeLens MT5 Analytics Server",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node tests/run-tests.js && node tests/regression-old-vs-new.js && NODE_PATH=tests/stubs/node_modules node tests/server-integration.js",
+    "backup": "node tools/backup.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
