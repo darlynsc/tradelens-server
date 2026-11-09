@@ -259,6 +259,9 @@ if (DATABASE_URL) {
       k TEXT PRIMARY KEY, v TEXT NOT NULL, updated TEXT NOT NULL DEFAULT '')`))
     .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_deals (
       ticket TEXT PRIMARY KEY, t BIGINT NOT NULL DEFAULT 0, d TEXT NOT NULL)`))
+    .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_annotations (
+      id TEXT PRIMARY KEY, items TEXT NOT NULL DEFAULT '[]', n INTEGER NOT NULL DEFAULT 0,
+      saved TEXT NOT NULL DEFAULT '', updated TEXT NOT NULL DEFAULT '')`))
     .then(() => console.log('🗄️  Journal: Postgres listo'))
     .catch(e => console.error('❌ Error preparando Postgres:', e.message));
   journalStore = {
@@ -310,6 +313,7 @@ if (DATABASE_URL) {
     async imgDel(id, day) {
       await ready;
       const r = await pool.query('DELETE FROM tl_images WHERE id=$1 AND day=$2', [id, day]);
+      if (r.rowCount > 0) { try { await pool.query('DELETE FROM tl_annotations WHERE id=$1', [id]); } catch (_) {} }
       return r.rowCount > 0;
     },
     async imgCountDay(day) {
@@ -331,6 +335,29 @@ if (DATABASE_URL) {
           `INSERT INTO tl_deals (ticket, t, d) SELECT * FROM unnest($1::text[], $2::bigint[], $3::text[]) ON CONFLICT (ticket) DO NOTHING`,
           [c.map(x => x[0]), c.map(x => Math.round(+x[1].time) || 0), c.map(x => JSON.stringify(x[1]))]);
       }
+    },
+    // ── Anotaciones (dibujos sobre las imágenes): gana la versión con `saved` más reciente ──
+    async annGet(id) {
+      await ready;
+      const { rows } = await pool.query('SELECT items, saved FROM tl_annotations WHERE id=$1', [id]);
+      if (!rows[0]) return null;
+      let items = []; try { const a = JSON.parse(rows[0].items); if (Array.isArray(a)) items = a; } catch (_) {}
+      return { items, saved: rows[0].saved };
+    },
+    async annPut(id, items, saved) {
+      await ready;
+      await pool.query(
+        `INSERT INTO tl_annotations (id, items, n, saved, updated) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (id) DO UPDATE SET items=EXCLUDED.items, n=EXCLUDED.n, saved=EXCLUDED.saved, updated=EXCLUDED.updated
+         WHERE tl_annotations.saved <= EXCLUDED.saved`,
+        [id, JSON.stringify(items), items.length, saved, new Date().toISOString()]);
+      return this.annGet(id);
+    },
+    async annCounts(ids) {
+      await ready;
+      const { rows } = await pool.query('SELECT id, n FROM tl_annotations WHERE id = ANY($1::text[]) AND n > 0', [ids]);
+      const out = {}; rows.forEach(r => { out[r.id] = { n: r.n }; });
+      return out;
     },
     imgPersistent: true
   };
@@ -370,6 +397,7 @@ if (DATABASE_URL) {
         const meta = JSON.parse(fs.readFileSync(path.join(d, id + '.json'), 'utf8'));
         if (meta.day !== day) return false;
         fs.unlinkSync(path.join(d, id + '.bin')); fs.unlinkSync(path.join(d, id + '.json'));
+        try { const m = JSON.parse(fs.readFileSync(path.join(dir, 'annotations.json'), 'utf8')); if (m[id]) { delete m[id]; fs.writeFileSync(path.join(dir, 'annotations.json'), JSON.stringify(m)); } } catch (_) {}
         return true;
       } catch (_) { return false; }
     },
@@ -384,6 +412,23 @@ if (DATABASE_URL) {
       const cur = new Map(await this.dealsAll());
       items.forEach(x => { if (!cur.has(x[0])) cur.set(x[0], x[1]); });
       try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'deals.json'), JSON.stringify([...cur])); } catch (_) {}
+    },
+    // Anotaciones en disco local: NO persistentes en Render sin disco. Solo para pruebas locales.
+    async annGet(id) {
+      try { const m = JSON.parse(fs.readFileSync(path.join(dir, 'annotations.json'), 'utf8')); return m[id] || null; } catch (_) { return null; }
+    },
+    async annPut(id, items, saved) {
+      let m = {}; try { m = JSON.parse(fs.readFileSync(path.join(dir, 'annotations.json'), 'utf8')); } catch (_) {}
+      if (!m[id] || (m[id].saved || '') <= saved) {
+        m[id] = { items, saved };
+        try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'annotations.json'), JSON.stringify(m)); } catch (_) {}
+      }
+      return m[id];
+    },
+    async annCounts(ids) {
+      let m = {}; try { m = JSON.parse(fs.readFileSync(path.join(dir, 'annotations.json'), 'utf8')); } catch (_) {}
+      const out = {}; ids.forEach(i => { if (m[i] && m[i].items && m[i].items.length) out[i] = { n: m[i].items.length }; });
+      return out;
     },
     imgPersistent: false
   };
@@ -522,6 +567,49 @@ app.delete('/journal/:day/images/:id', async (req, res) => {
   if (!JKEY_RE.test(day) || !/^[a-f0-9]{32}$/.test(id)) return res.status(400).json({ error: 'Parámetros inválidos' });
   try { res.json({ ok: true, deleted: await journalStore.imgDel(id, day) }); }
   catch (e) { console.error(e); res.status(500).json({ error: 'Error borrando imagen' }); }
+});
+
+// ── ANOTACIONES (dibujos sobre las imágenes del journal) ──────────────────────
+// Un registro por imagen (id de 32 hex): { items, saved }. Los dibujos se guardan en la nube y los lee cualquier aparato.
+// Regla: queda la versión con `saved` más reciente (la última modificación hecha desde cualquier aparato, incluido "borrar todo").
+// Un envío más antiguo que lo guardado no pisa nada (se responde ok con lo vigente); repetir el mismo `saved` es un reintento idempotente.
+const ANN_MAX_ITEMS = 2000;
+const ANN_MAX_BYTES = 2 * 1024 * 1024;
+app.put('/annotations/:id', async (req, res) => {
+  if (!checkToken(req, res)) return;
+  const id = req.params.id;
+  if (!/^[a-f0-9]{32}$/.test(id)) return res.status(400).json({ error: 'Id inválido' });
+  const b = req.body || {};
+  if (!Array.isArray(b.items) || b.items.length > ANN_MAX_ITEMS || !b.items.every(x => x && typeof x === 'object' && !Array.isArray(x)))
+    return res.status(400).json({ error: 'Anotaciones inválidas' });
+  if (JSON.stringify(b.items).length > ANN_MAX_BYTES) return res.status(413).json({ error: 'Las anotaciones son demasiado grandes.' });
+  let saved = String(b.saved || '').slice(0, 40);
+  if (!Number.isFinite(Date.parse(saved))) saved = new Date().toISOString();
+  try {
+    const current = await journalStore.annPut(id, b.items, saved);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, annotation: current || null });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Error guardando anotaciones' }); }
+});
+
+app.get('/annotations/:id', async (req, res) => {
+  if (!checkToken(req, res)) return;
+  const id = req.params.id;
+  if (!/^[a-f0-9]{32}$/.test(id)) return res.status(400).json({ error: 'Id inválido' });
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ annotation: (await journalStore.annGet(id)) || null });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Error leyendo anotaciones' }); }
+});
+
+// Cantidad de dibujos por imagen (distintivo ✏️ en las miniaturas): /annotations?ids=id1,id2,...
+app.get('/annotations', async (req, res) => {
+  if (!checkToken(req, res)) return;
+  const ids = String(req.query.ids || '').split(',').filter(x => /^[a-f0-9]{32}$/.test(x)).slice(0, 200);
+  try {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ annotations: ids.length ? await journalStore.annCounts(ids) : {} });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Error leyendo anotaciones' }); }
 });
 
 app.get('/journal-config', (req, res) => {
@@ -945,7 +1033,7 @@ app.get('/status', (req, res) => {
     deals_count: lastDealCount,
     positions_count: accountData?.positions?.length || 0,
     sse_clients: sseClients.size,
-    features: { mt5_capture: true, journal_images: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, swing_cycles: true, push: true },
+    features: { mt5_capture: true, journal_images: true, annotations: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, swing_cycles: true, push: true },
     swing_cycles: swingView ? swingView.stats : null,
     price_exc_count: accountData?.price_exc ? Object.keys(accountData.price_exc).length : 0,
     version: '1.4.0'
