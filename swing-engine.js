@@ -13,33 +13,11 @@
 //    de EE. UU.). Los deals llevan la hora del servidor del bróker codificada como epoch; se pasa a UTC restando el
 //    offset del bróker (TimeCurrent − TimeGMT, que envía la EA) y de UTC a Nueva York. Clave de sesión = fecha NY de
 //    (hora NY + 7 h). Una posición es SWING si abarca más de una sesión NY.
-//
-// REFERENCIA TEMPORAL (esta versión; ver TIME_NOTES al final):
-//  · nowDay ya NO sale de snapshot.timestamp (hora del bróker, congelada sin cotizaciones) sino de resolveNow(): UTC del
-//    servidor (+ UTC observado por la EA como evidencia) → sesión NY. Tres modos: 'fresh' (snapshot nuevo), 'replay'
-//    (snapshot recuperado del almacenamiento al arrancar) y 'server_reevaluation' (el servidor avanza el reloj sin snapshot).
-//  · La conversión bróker→UTC usa un historial de regímenes de offset (offsetAt). El offset heredado se captura UNA vez en la
-//    migración y queda congelado para todo lo anterior al primer régimen validado. NO hay reconstrucción retroactiva.
-//  · Un ciclo con id SWING nunca se degrada. Ids nuevos solo con confianza HIGH/MEDIUM.
 'use strict';
 
 const EPS = 1e-7;
-const VERSION = 1;          // NO incrementar: un cambio de VERSION reinicializa el estado (ver update()). La ampliación es aditiva (state.tm).
-const TM_SCHEMA = 1;        // versión del bloque temporal aditivo state.tm
+const VERSION = 1;
 const MAX_SESSION_LOG = 90;
-// Parámetros temporales centralizados (configurables con setConfig; el servidor puede sobrescribirlos).
-const CFG = {
-  QUOTE_MAX_AGE: 120,        // s: antigüedad máxima de la última cotización para aceptar una observación de offset
-  OFFSET_STEP: 900,          // el offset debe ser múltiplo de 15 min
-  OFFSET_MAX: 14 * 3600,     // |offset| máximo
-  OFFSET_XCHECK_TOL: 600,    // s: coherencia offset ↔ reloj del servidor (450 de redondeo a 900 + latencia/deriva)
-  CLOCK_TOL: 120,            // s: tolerancia entre el UTC de la EA y el reloj del servidor
-  CONFIRM_N: 2,              // observaciones coherentes y distintas para confirmar un cambio de offset
-  STALE_SECS: 180,           // s: pasado este tiempo sin snapshot el estado se considera potencialmente desactualizado
-  MAX_REEVAL_AGE: 48 * 3600, // s: con un snapshot más antiguo que esto la reevaluación pasa a confianza LOW
-  PERSIST_EVERY: 60          // s: frecuencia máxima con que los campos temporales rutinarios marcan el estado como "changed"
-};
-function setConfig(o) { Object.assign(CFG, o || {}); }
 
 const dayKey = t => new Date(t * 1000).toISOString().slice(0, 10);   // fecha de un epoch ya convertido
 // ── Sesión de Nueva York ──────────────────────────────────────────────────────────────────────────────────
@@ -51,9 +29,7 @@ function nyOffsetSec(utc) {
   return (utc >= s && utc < e) ? -4 * 3600 : -5 * 3600;
 }
 // t = epoch con hora del servidor del bróker; off = offset del bróker en segundos (hora servidor − UTC)
-// Clave de sesión de un instante UTC (única implementación; el dashboard usa la misma fórmula)
-function nySessionKeyUtc(u) { return new Date((u + nyOffsetSec(u) + 7 * 3600) * 1000).toISOString().slice(0, 10); }
-function sessionKey(t, off) { return nySessionKeyUtc(t - (off || 0)); }
+function sessionKey(t, off) { const u = t - (off || 0); return new Date((u + nyOffsetSec(u) + 7 * 3600) * 1000).toISOString().slice(0, 10); }
 const n0 = v => (typeof v === 'number' && Number.isFinite(v)) ? v : 0;
 const r2 = v => { const x = Math.round((v + Number.EPSILON) * 100) / 100; return x === 0 ? 0 : x; };
 const tk = v => { const x = Number(v); return Number.isFinite(x) ? x : 0; };
@@ -71,159 +47,8 @@ function weakOrder(a, b) {
   return a.t === b.t && !(a.msc != null && b.msc != null && a.msc !== b.msc);
 }
 
-function emptyState(account, counterFloor) {
-  const s = { v: VERSION, account: account || null, records: {}, ids: {}, counters: {}, sessionLog: {}, ambiguities: {} };
-  if (counterFloor) for (const [y, n] of Object.entries(counterFloor)) s.counters[y] = n;   // ids únicos entre cuentas
-  migrate(s);
-  return s;
-}
-
-// ── MIGRACIÓN ADITIVA E IDEMPOTENTE ───────────────────────────────────────────────────────────────────────
-// Solo AÑADE campos ausentes (state.tm, state.dealMeta, state.swingMeta). No toca records, ids, counters, sessionLog,
-// ambiguities ni campos desconocidos. El offset heredado se captura UNA sola vez (la primera migración) y queda congelado.
-function migrate(state, opts) {
-  let ch = false;
-  if (!state.tm || typeof state.tm !== 'object') { state.tm = {}; ch = true; }
-  const tm = state.tm;
-  if (tm.schema !== TM_SCHEMA) { tm.schema = TM_SCHEMA; ch = true; }
-  if (!tm.offsets || typeof tm.offsets !== 'object') {
-    const bo = (typeof state.brokerOffset === 'number' && Number.isFinite(state.brokerOffset)) ? state.brokerOffset : null;
-    tm.offsets = { legacy: { off: bo, frozen: true, uncertain: true, verifiedUtc: null,
-                             reason: bo == null ? 'sin_offset_persistido' : 'no_verificado', capturedUtc: (opts && opts.nowUtc) || null },
-                   regimes: [], pending: null, lastValid: null };
-    ch = true;
-  }
-  if (!Array.isArray(tm.offsets.regimes)) { tm.offsets.regimes = []; ch = true; }
-  if (typeof tm.maxUtc !== 'number') { tm.maxUtc = 0; ch = true; }
-  if (typeof tm.maxDay !== 'string') { tm.maxDay = ''; ch = true; }
-  if (typeof tm.persistedAt !== 'number') { tm.persistedAt = 0; ch = true; }
-  if (tm.lastSnap === undefined) { tm.lastSnap = null; ch = true; }
-  if (!state.dealMeta || typeof state.dealMeta !== 'object') { state.dealMeta = {}; ch = true; }
-  if (!state.swingMeta || typeof state.swingMeta !== 'object') { state.swingMeta = {}; ch = true; }
-  return ch;
-}
-
-// ── REGÍMENES DE OFFSET ───────────────────────────────────────────────────────────────────────────────────
-function curOffset(state) {
-  const o = state.tm.offsets;
-  return o.regimes.length ? o.regimes[o.regimes.length - 1].off : o.legacy.off;
-}
-// Offset (s) aplicable a un instante de hora de bróker. Antes del primer régimen validado → offset heredado congelado.
-// Sin heredado ni regímenes → estimación `est` (comportamiento anterior) o 0.
-function offsetAt(state, tBroker, est) {
-  const o = state.tm.offsets;
-  for (let i = o.regimes.length - 1; i >= 0; i--) if (o.regimes[i].fromBroker <= tBroker) return o.regimes[i].off;
-  if (o.legacy.off != null) return o.legacy.off;
-  return est != null ? est : 0;
-}
-function sessionKeyAt(state, tBroker, est) { return sessionKey(tBroker, offsetAt(state, tBroker, est)); }
-// Tabla compacta para el dashboard (misma regla que offsetAt)
-function offsetTable(state) {
-  const o = state.tm.offsets;
-  return { legacy: { off: o.legacy.off, uncertain: !!o.legacy.uncertain, reason: o.legacy.reason || null },
-           regimes: o.regimes.map(r => ({ from: r.fromBroker, off: r.off, conf: r.conf, validated: !!r.validated })) };
-}
-
-// Observación de offset: SOLO es fiable con los campos nuevos de la EA (quote_age, utc_obs, connected) y cotización reciente.
-function offsetObservation(snap, serverUtc) {
-  const s = snap && snap.session;
-  if (!s) return { valid: false, reason: 'sin_session' };
-  const off = s.broker_offset;
-  if (typeof off !== 'number' || !Number.isFinite(off)) return { valid: false, reason: 'sin_offset' };
-  if (typeof s.utc_obs !== 'number' || typeof s.quote_age !== 'number') return { valid: false, reason: 'ea_sin_campos_nuevos' };
-  if (s.connected === false) return { valid: false, reason: 'terminal_desconectado' };
-  if (s.quote_age < 0 || s.quote_age > CFG.QUOTE_MAX_AGE) return { valid: false, reason: 'cotizacion_no_fresca' };
-  if (off % CFG.OFFSET_STEP !== 0) return { valid: false, reason: 'no_multiplo_900' };
-  if (Math.abs(off) > CFG.OFFSET_MAX) return { valid: false, reason: 'fuera_de_rango' };
-  const bt = n0(snap.timestamp);
-  // La hora real del bróker ≈ TimeCurrent + antigüedad de la cotización; contra el reloj INDEPENDIENTE del servidor
-  // debe dar el offset (descarta reloj del PC desfasado u hora congelada).
-  const diff = (bt + s.quote_age) - serverUtc - off;
-  if (Math.abs(diff) > CFG.OFFSET_XCHECK_TOL) return { valid: false, reason: 'incoherente_con_reloj_servidor' };
-  return { valid: true, off, obsBroker: bt, obsUtc: serverUtc, age: s.quote_age };
-}
-// Aplica una observación válida. Devuelve { changed, event }. Un cambio requiere CONFIRM_N observaciones coherentes y
-// DISTINTAS (por seq); el nuevo régimen rige desde la hora de bróker de la observación que lo confirma (nunca hacia atrás).
-function applyOffsetObservation(state, obs, seq, amb) {
-  const o = state.tm.offsets, cur = curOffset(state);
-  let changed = false, event = null;
-  if (cur == null) {                       // nunca hubo offset: primer régimen directo
-    // No hay offset heredado que preservar (estado nuevo / cuenta nueva): el primer offset validado rige desde el epoch (0; JSON no admite -Infinity).
-    o.regimes.push({ off: obs.off, fromBroker: 0, obsUtc: obs.obsUtc, obsBroker: obs.obsBroker, src: 'observed', conf: 'HIGH', validated: true, n: 1, firstEver: true });
-    o.pending = null; return { changed: true, event: 'first_regime' };
-  }
-  if (obs.off === cur) {
-    if (o.pending) { o.pending = null; changed = true; }
-    if (!o.regimes.length && o.legacy.uncertain) {     // el heredado coincide con una observación válida: deja de ser incierto
-      o.legacy.uncertain = false; o.legacy.verifiedUtc = obs.obsUtc; o.legacy.reason = 'verificado'; changed = true; event = 'legacy_verified';
-    }
-    if (!o.lastValid || obs.obsUtc - o.lastValid.utc >= CFG.PERSIST_EVERY || o.lastValid.off !== obs.off) {
-      o.lastValid = { off: obs.off, utc: obs.obsUtc, broker: obs.obsBroker }; changed = true;
-    }
-    return { changed, event };
-  }
-  // difiere del vigente
-  if (!o.regimes.length && o.legacy.off != null && o.legacy.uncertain && amb)
-    amb.push({ code: 'offset_heredado_discrepante', pids: [], msg: 'Una observación válida difiere del offset heredado (' + o.legacy.off + ' s vs ' + obs.off + ' s). Se conserva el heredado para lo anterior; no se reconstruye nada.' });
-  if (o.pending && o.pending.off === obs.off) { if (o.pending.lastSeq !== seq || seq == null) { o.pending.n++; o.pending.lastSeq = seq; } }
-  else o.pending = { off: obs.off, n: 1, firstBroker: obs.obsBroker, firstUtc: obs.obsUtc, lastSeq: seq };
-  changed = true;
-  if (o.pending.n >= CFG.CONFIRM_N) {
-    const last = o.regimes.length ? o.regimes[o.regimes.length - 1].fromBroker : -Infinity;
-    if (obs.obsBroker > last) {
-      o.regimes.push({ off: obs.off, fromBroker: obs.obsBroker, obsUtc: obs.obsUtc, obsBroker: obs.obsBroker, src: 'observed', conf: 'HIGH', validated: true, n: o.pending.n, firstUtc: o.pending.firstUtc });
-      event = 'new_regime';
-    }
-    o.pending = null;
-  }
-  return { changed, event };
-}
-
-// ── RESOLUCIÓN DE LA SESIÓN ACTUAL (única función central) ────────────────────────────────────────────────
-// Confianza de una referencia de snapshot { srvUtc, eaUtc, sid }
-function snapConf(ref) {
-  if (!ref) return 'LOW';
-  if (ref.conf) return ref.conf;
-  if (typeof ref.eaUtc === 'number' && ref.eaUtc > 0) {
-    if (Math.abs(ref.eaUtc - ref.srvUtc) > CFG.CLOCK_TOL) return 'MEDIUM';
-    return (!ref.sid || ref.sid === nySessionKeyUtc(ref.srvUtc) || ref.sid === nySessionKeyUtc(ref.eaUtc)) ? 'HIGH' : 'MEDIUM';
-  }
-  // EA antigua (sin UTC propio): el session.id de la EA coincidiendo con el reloj del servidor es evidencia suficiente → MEDIUM
-  return (ref.sid && ref.sid === nySessionKeyUtc(ref.srvUtc)) ? 'MEDIUM' : 'LOW';
-}
-// ctx = { mode, serverUtc, snapshot, lastSnapHint, nowT, legacyOff }
-function resolveNow(state, ctx) {
-  const tm = state.tm, mode = ctx.mode, srv = ctx.serverUtc, flags = [];
-  let utc, conf, source, eaUtc = null, changed = false;
-  const ls = tm.lastSnap || ctx.lastSnapHint || null;
-  if (mode === 'fresh') {
-    const s = ctx.snapshot && ctx.snapshot.session;
-    eaUtc = (s && typeof s.utc_obs === 'number' && s.utc_obs > 0) ? s.utc_obs : null;
-    const sid = s && s.id ? String(s.id).replace(/\./g, '-') : null;
-    utc = srv;                                                    // el servidor es la autoridad
-    if (eaUtc != null) {
-      if (Math.abs(eaUtc - srv) <= CFG.CLOCK_TOL) { source = 'server+ea'; conf = snapConf({ srvUtc: srv, eaUtc, sid }); if (conf === 'MEDIUM') flags.push('session_id_discrepante'); }
-      else { source = 'server_clock'; conf = 'MEDIUM'; flags.push('reloj_ea_sospechoso'); }
-    } else { source = 'server_fallback'; flags.push('ea_sin_utc'); conf = snapConf({ srvUtc: srv, eaUtc: null, sid }); }
-    tm.lastSnap = { srvUtc: srv, eaUtc, sid, conf, seq: (ctx.snapshot && typeof ctx.snapshot.seq === 'number') ? ctx.snapshot.seq : null, brokerTs: ctx.nowT };
-    changed = true;
-  } else if (mode === 'replay') {
-    if (ls) { utc = ls.srvUtc; conf = snapConf(ls); source = 'replay'; if (!ls.srvUtc) { utc = tm.maxUtc; conf = 'LOW'; } }
-    else { utc = ctx.nowT - (ctx.legacyOff || 0); conf = 'LOW'; source = 'legacy_broker_time'; flags.push('sin_referencia_previa'); }
-  } else {                                                        // server_reevaluation
-    utc = srv; source = 'server_clock';
-    if (!ls) { conf = 'LOW'; flags.push('sin_snapshot_previo'); }
-    else if (srv - ls.srvUtc > CFG.MAX_REEVAL_AGE) { conf = 'LOW'; flags.push('snapshot_muy_antiguo'); }
-    else conf = snapConf(ls) === 'LOW' ? 'LOW' : 'MEDIUM';        // sin snapshot nuevo nunca es HIGH
-  }
-  // Monotonicidad: una observación vieja no hace retroceder el reloj ni la sesión
-  if (utc < tm.maxUtc) { utc = tm.maxUtc; flags.push('utc_retroceso_ignorado'); }
-  let day = nySessionKeyUtc(utc);
-  if (tm.maxDay && day < tm.maxDay) { day = tm.maxDay; flags.push('sesion_retroceso_ignorada'); }
-  if (utc > tm.maxUtc) { tm.maxUtc = utc; if (utc - tm.persistedAt >= CFG.PERSIST_EVERY) { tm.persistedAt = utc; changed = true; } }
-  if (day > tm.maxDay) { tm.maxDay = day; changed = true; }
-  const snapAge = ls && ls.srvUtc ? Math.max(0, Math.round(srv - ls.srvUtc)) : null;
-  return { utc, day, conf, source, flags, mode, eaUtc, snapAge, changed, lastSnapUtc: ls ? ls.srvUtc : null };
+function emptyState(account) {
+  return { v: VERSION, account: account || null, records: {}, ids: {}, counters: {}, sessionLog: {}, ambiguities: {} };
 }
 
 function normDeal(d) {
@@ -240,13 +65,13 @@ function normDeal(d) {
 const ordOfDeal = d => ({ t: d.t, msc: d.msc, ticket: tk(d.ticket) });
 
 // ── 1) Incorporar deals al almacén de registros (acumula; mismo ticket = mismo deal, no se duplica) ──────────
-function mergeDeals(state, deals, newDeals) {
+function mergeDeals(state, deals) {
   let changed = false;
   for (const raw of (deals || [])) {
     const d = normDeal(raw); if (!d) continue;
     const rec = state.records[d.pid] || (state.records[d.pid] = { pid: d.pid, deals: {} });
     const prev = rec.deals[d.ticket];
-    if (!prev || JSON.stringify(prev) !== JSON.stringify(d)) { rec.deals[d.ticket] = d; changed = true; if (!prev && newDeals) newDeals.push(d); }
+    if (!prev || JSON.stringify(prev) !== JSON.stringify(d)) { rec.deals[d.ticket] = d; changed = true; }
   }
   return changed;
 }
@@ -341,18 +166,12 @@ function sweep(derived, state) {
 }
 
 // ── 4) Resumen de un ciclo: posiciones, sesiones, resultados ──────────────────────────────────────────────
-function summarize(c, nowT, nowDay, positionsByPid, sk, ctx) {
+function summarize(c, nowT, nowDay, positionsByPid, sk) {
   const recs = c.recs.slice().sort((a, b) => cmpOrd(a.ds.length ? ordOfDeal(a.ds[0]) : a.openOrd, b.ds.length ? ordOfDeal(b.ds[0]) : b.openOrd));
   const finished = c.endOrd != null;
   const startT = c.startOrd.t, endT = finished ? c.endOrd.t : null;
   const startDay = sk(startT), endDay = finished ? sk(endT) : null;
-  // Regla vigente (sin duración mínima): ciclo cerrado → sesión de apertura ≠ de cierre; ciclo abierto → apertura ≠ sesión actual.
-  const natural = c.verifiable && startDay !== (finished ? endDay : nowDay);
-  const hasId = !!(ctx && ctx.hasId), canAssign = ctx ? ctx.canAssign !== false : true;
-  // Un ciclo con id no se degrada; uno nuevo solo se promueve con confianza suficiente (si no, queda provisional).
-  const isSwing = hasId || (natural && canAssign);
-  const provisional = natural && !isSwing;
-  const noDegrade = hasId && !natural;
+  const isSwing = c.verifiable && startDay !== (finished ? endDay : nowDay);
 
   // Eventos de deals con estado acumulado por posición
   const all = [];
@@ -437,7 +256,6 @@ function summarize(c, nowT, nowDay, positionsByPid, sk, ctx) {
   if (recs.some(r => r.status === 'indeterminate')) flags.push('estado_indeterminado');
   return {
     id: null, sym: c.sym, side: c.side, state: finished ? 'finished' : 'active', isSwing, verifiable: c.verifiable,
-    provisional, noDegrade, lastKnownOpen: !finished && !!(ctx && ctx.mode && ctx.mode !== 'fresh'),
     startT, endT, startDay, endDay, lastDay, spanDays,
     pids: positions.map(p => p.pid), positions,
     counts: { total: positions.length, closed: closedN, open: openN, partialOpen: partialOpenN },
@@ -449,76 +267,39 @@ function summarize(c, nowT, nowDay, positionsByPid, sk, ctx) {
 // ── 5) Actualización completa: snapshot → estado + vista ──────────────────────────────────────────────────
 // opts.snapshot = cuerpo de /sync (ya validado por el servidor). Devuelve { state, view, changed }.
 function update(prevState, snapshot, opts) {
-  opts = opts || {};
-  const mode = opts.mode || 'fresh';                         // 'fresh' | 'replay' | 'server_reevaluation'
-  const fresh = mode === 'fresh';
-  const serverUtc = typeof opts.serverNow === 'number' ? opts.serverNow : Date.now() / 1000;
   const acct = snapshot && snapshot.account ? String(snapshot.account.number) : null;
-  // El servidor archiva el estado de la cuenta anterior ANTES de llamar aquí (sync-core.switchAccountState); esta rama es solo red de seguridad.
-  let state = prevState && prevState.v === VERSION && (!acct || !prevState.account || prevState.account === acct) ? prevState : emptyState(acct, opts.counterFloor);
+  let state = prevState && prevState.v === VERSION && (!acct || !prevState.account || prevState.account === acct) ? prevState : emptyState(acct);
   let changed = state !== prevState;
   if (acct && state.account !== acct) { state.account = acct; changed = true; }
-  if (migrate(state, { nowUtc: Math.floor(serverUtc) })) changed = true;
 
-  // Replay y reevaluación NO incorporan datos: no hay deals nuevos ni registros nuevos (el servidor no inventa actividad).
-  const newDeals = [];
-  if (fresh) {
-    if (mergeDeals(state, snapshot.deals, newDeals)) changed = true;
-    if (mergeDeals(state, snapshot.recovery_deals, newDeals)) changed = true;
-  }
+  if (mergeDeals(state, snapshot.deals)) changed = true;
 
   const openMap = {};
   for (const p of (snapshot.positions || [])) {
     const id = String(p.position_id != null ? p.position_id : p.ticket);
     openMap[id] = p;
-    if (fresh && !state.records[id]) { state.records[id] = { pid: id, deals: {} }; changed = true; }
+    if (!state.records[id]) { state.records[id] = { pid: id, deals: {} }; changed = true; }
   }
   const nowT = n0(snapshot.timestamp) || Math.max(0, ...Object.values(state.records).flatMap(r => Object.values(r.deals).map(d => d.t)));
-  const amb = [];
-
-  // Offset: observación validada (solo snapshot nuevo). Sin observación fiable se conserva el último régimen validado/heredado.
-  if (fresh) {
-    const obs = offsetObservation(snapshot, serverUtc);
-    if (obs.valid) {
-      const r = applyOffsetObservation(state, obs, typeof snapshot.seq === 'number' ? snapshot.seq : null, amb);
-      if (r.changed) changed = true;
-    } else if (snapshot.session && typeof snapshot.session.broker_offset === 'number' && obs.reason !== 'ea_sin_campos_nuevos') {
-      // observación descartada (cotización vieja, desconectado, incoherente…): se conserva el offset vigente; no es un cambio real
-    }
-  }
-  const o0 = state.tm.offsets;
-  const estOff = (o0.legacy.off == null && !o0.regimes.length) ? Math.round((nowT - serverUtc) / 900) * 900 : null;   // comportamiento anterior, solo sin offset alguno
-  const off = (curOffset(state) != null) ? curOffset(state) : (estOff != null ? estOff : 0);
-  const sk = t => sessionKeyAt(state, t, estOff);
-
-  // Sesión actual: función central. nowDay deja de depender de snapshot.timestamp.
-  const rn = resolveNow(state, { mode, serverUtc, snapshot, lastSnapHint: opts.lastSnapHint, nowT, legacyOff: off });
-  if (rn.changed) changed = true;
-  const nowDay = rn.day;
-  const canAssign = mode !== 'replay' && rn.conf !== 'LOW';
-
-  // Metadatos independientes por deal NUEVO (state.dealMeta; nunca dentro del deal, para que mergeDeals no los pise).
-  // Estimación UTC solo si la ejecución está próxima a la recepción; los deals ya existentes no tienen meta (= heredados).
-  if (fresh) for (const d of newDeals) {
-    if (state.dealMeta[d.ticket]) continue;
-    const near = rn.conf !== 'LOW' && Math.abs(d.t - nowT) <= 120;
-    state.dealMeta[d.ticket] = { seenUtc: Math.floor(serverUtc), off: offsetAt(state, d.t, estOff), est: near ? Math.round(serverUtc - (nowT - d.t)) : null,
-      conf: rn.conf, src: near ? 'recv' : 'late' };
-    changed = true;
-  }
+  // Offset del bróker: lo que envía la EA (exacto) → el último conocido → estimación por reloj del servidor → 0
+  let off = null;
+  const eaOff = snapshot.session && typeof snapshot.session.broker_offset === 'number' ? snapshot.session.broker_offset : null;
+  if (eaOff != null && Number.isFinite(eaOff)) { off = eaOff; if (state.brokerOffset !== off) { state.brokerOffset = off; changed = true; } }
+  else if (typeof state.brokerOffset === 'number') off = state.brokerOffset;
+  else if (opts && typeof opts.serverNow === 'number') off = Math.round((nowT - opts.serverNow) / 900) * 900;
+  else off = 0;
+  const sk = t => sessionKey(t, off);
+  const nowDay = sk(nowT);
 
   const derived = Object.values(state.records).map(rec => deriveRecord(rec, openMap[rec.pid]));
-  const sw = sweep(derived, state);
-  const cycles = sw.cycles; sw.amb.forEach(a => amb.push(a));
+  const { cycles, amb } = sweep(derived, state);
   if (snapshot.deals_truncated === true)
     amb.push({ code: 'historial_truncado', pids: [], msg: 'La EA envía solo los deals más recientes: ciclos anteriores a esa ventana pueden estar incompletos. Los ya conocidos se conservan.' });
 
   // Resumen + identificadores persistentes (solo los ciclos SWING reciben id; el id se ancla a sus posiciones)
-  const out = [], pending = [];
+  const out = [];
   for (const c of cycles) {
-    const hasId = c.recs.some(r => state.ids[r.pid]);
-    const s = summarize(c, nowT, nowDay, openMap, sk, { hasId, canAssign, mode });
-    if (s.noDegrade) amb.push({ code: 'swing_no_reconfirmable', pids: s.pids, msg: 'El ciclo ya tiene id SWING y la referencia temporal actual no lo reproduce; se conserva como SWING (no se degrada).' });
+    const s = summarize(c, nowT, nowDay, openMap, sk);
     if (s.isSwing) {
       const known = [...new Set(s.pids.map(p => state.ids[p]).filter(Boolean))];
       let id = known.length ? known.sort()[0] : null;
@@ -527,17 +308,16 @@ function update(prevState, snapshot, opts) {
         const y = s.startDay.slice(0, 4);
         state.counters[y] = (state.counters[y] || 0) + 1;
         id = 'SWING-' + y + '-' + String(state.counters[y]).padStart(6, '0');
-        state.swingMeta[id] = { firstUtc: Math.floor(serverUtc), mode, conf: rn.conf, source: rn.source };
         changed = true;
       }
       for (const p of s.pids) if (state.ids[p] !== id) { state.ids[p] = id; changed = true; }
       s.id = id;
-    } else if (s.provisional) pending.push(s);
+    }
     out.push(s);
   }
 
   // Snapshots por sesión (evidencia de continuidad): una entrada por sesión operativa, sin crear deals ni aperturas.
-  const sess = fresh ? snapshot.session : null;
+  const sess = snapshot.session;
   if (sess && sess.id) {
     const pids = Object.keys(openMap).sort();
     const prev = state.sessionLog[sess.id];
@@ -553,9 +333,6 @@ function update(prevState, snapshot, opts) {
   // Confirmaciones por ciclo: sesiones cuyo snapshot lo vio abierto
   for (const s of out) {
     s.confirmedSessions = Object.values(state.sessionLog).filter(l => l.pids.some(p => s.pids.includes(p))).map(l => ({ id: l.id, kind: l.kind, ts: l.ts })).sort((a, b) => a.id < b.id ? -1 : 1);
-    // ¿El cruce lo confirmó MT5 o solo lo detectó el reloj del servidor?
-    if (s.isSwing) s.crossing = { sOpen: s.startDay, sEnd: s.state === 'finished' ? s.endDay : nowDay,
-      basis: s.state === 'finished' ? 'mt5_deals' : (s.confirmedSessions.some(l => { const d = String(l.id).replace(/\./g, '-'); return d > s.startDay; }) ? 'mt5_snapshot' : 'server_inferred') };
   }
 
   // Ambigüedades (deduplicadas, persistentes)
@@ -570,14 +347,8 @@ function update(prevState, snapshot, opts) {
   }
 
   const swing = out.filter(s => s.isSwing);
-  const lsRef = state.tm.lastSnap || opts.lastSnapHint || null;
   const view = {
     version: VERSION, account: state.account, nowDay, brokerOffset: off, sessionRule: 'NY_1700',
-    time: { nowDay, utc: Math.floor(rn.utc), source: rn.source, confidence: rn.conf, mode, flags: rn.flags, canAssign,
-            eaUtc: rn.eaUtc, clockSuspect: rn.flags.includes('reloj_ea_sospechoso'), lastSnapshotUtc: lsRef ? lsRef.srvUtc : null,
-            confirmedBySnapshot: fresh, serverReevaluated: mode === 'server_reevaluation', maxDay: state.tm.maxDay },
-    offsets: offsetTable(state),
-    pending,
     cycles: swing,
     pidCycle: Object.fromEntries(swing.flatMap(s => s.pids.map(p => [p, s.id]))),
     stats: {
@@ -586,14 +357,11 @@ function update(prevState, snapshot, opts) {
       active: swing.filter(s => s.state === 'active').length,
       wins: swing.filter(s => s.state === 'finished' && s.realized.net > 0).length,
       losses: swing.filter(s => s.state === 'finished' && s.realized.net < 0).length,
-      positions: swing.reduce((a, s) => a + s.counts.total, 0),
-      pending: pending.length
+      positions: swing.reduce((a, s) => a + s.counts.total, 0)
     },
     ambiguities: Object.values(state.ambiguities).filter(a => a.active)
   };
-  return { state, view, changed, resolve: rn };
+  return { state, view, changed };
 }
 
-module.exports = { update, emptyState, migrate, dayKey, sessionKey, sessionKeyAt, nySessionKeyUtc, nyOffsetSec, offsetAt, offsetTable, curOffset,
-  offsetObservation, applyOffsetObservation, resolveNow, snapConf, setConfig, CFG, VERSION, TM_SCHEMA,
-  _internals: { mergeDeals, deriveRecord, sweep, summarize } };
+module.exports = { update, emptyState, dayKey, sessionKey, nyOffsetSec, VERSION, _internals: { mergeDeals, deriveRecord, sweep, summarize } };
