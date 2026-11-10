@@ -394,7 +394,14 @@ if (DATABASE_URL) {
          ON CONFLICT (day) DO UPDATE SET tag=EXCLUDED.tag, note=EXCLUDED.note, img=EXCLUDED.img, imgs=EXCLUDED.imgs, saved=EXCLUDED.saved
          WHERE tl_journal.saved < EXCLUDED.saved`, [day, e.tag, e.note, e.img, JSON.stringify(e.imgs || []), e.saved]);
       const { rows } = await pool.query('SELECT tag, note, img, imgs, saved FROM tl_journal WHERE day=$1', [day]);
-      return rows[0] ? { ...rows[0], imgs: parseImgs(rows[0].imgs) } : rows[0];
+      const cur = rows[0] ? { ...rows[0], imgs: parseImgs(rows[0].imgs) } : rows[0];
+      // La asignación captura → Trade vive en tl_images.ref (es lo que lee all()). Se actualiza solo si esta es la versión vigente
+      // (mismo `saved`; también al reenviar la misma versión) y solo si el cliente envió imgRefs.
+      if (cur && e.imgRefs && cur.saved === e.saved) {
+        for (const id of cur.imgs) await pool.query('UPDATE tl_images SET ref=$1 WHERE id=$2 AND day=$3', [e.imgRefs[id] || '', id, day]);
+        cur.imgRefs = e.imgRefs;
+      }
+      return cur;
     },
     // ── Imágenes (bytea en Postgres: persistente, sin credenciales extra) ──
     async imgPut(id, day, ref, mime, buf) {
@@ -493,6 +500,9 @@ if (DATABASE_URL) {
     async all() { return cache; },
     async put(day, e) {
       if (!cache[day] || (cache[day].saved || '') < e.saved) {
+        if (e.imgRefs === undefined && cache[day] && cache[day].imgRefs) {   // p. ej. la captura de MT5 añade una imagen sin tocar las asignaciones
+          e = { ...e, imgRefs: {} }; (e.imgs || []).forEach(id => { if (cache[day].imgRefs[id]) e.imgRefs[id] = cache[day].imgRefs[id]; });
+        }
         cache[day] = e;
         try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(file, JSON.stringify(cache)); } catch (_) {}
       }
@@ -642,6 +652,15 @@ app.put('/journal/:day', async (req, res) => {
     imgs:  parseImgs(b.imgs),                    // ids de imágenes subidas
     saved: String(b.saved || new Date().toISOString()).slice(0, 40)
   };
+  // Asignación captura → Trade (arrastrar "Trade N" sobre una captura): { idImagen: "N" }. Solo se aceptan ids de esta entrada.
+  // Si el cliente no la envía (versión vieja) queda undefined y las asignaciones guardadas no se tocan.
+  if (b.imgRefs && typeof b.imgRefs === 'object' && !Array.isArray(b.imgRefs)) {
+    entry.imgRefs = {};
+    entry.imgs.forEach(id => {
+      const r = String(b.imgRefs[id] == null ? '' : b.imgRefs[id]).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 30);
+      if (r) entry.imgRefs[id] = r;
+    });
+  }
   try {
     const current = await journalStore.put(day, entry);
     notifyJournal(day);
