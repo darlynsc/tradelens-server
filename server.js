@@ -990,7 +990,8 @@ async function loadState() {
           else console.error('⛔ Migración incompleta: se sigue usando la tabla heredada tl_deals.');
         }
       }
-      if (DATABASE_URL) journalStore.dealsV2 = !!(mig && mig.ok);
+      // Siempre v2 (cuenta+ticket): la tabla heredada tl_deals (sin cuenta, posible mezcla real/demo) NO se lee ni se modifica; el archivo por cuenta empieza limpio y se llena con los deals que envía la EA.
+      if (DATABASE_URL) journalStore.dealsV2 = true;
       console.log(`🗃️  Archivo de deals: modo ${journalStore.dealsV2 ? 'v2 (cuenta+ticket)' : 'heredado (solo ticket — sin aislamiento entre cuentas; ver MIGRATION.md)'}`);
       const rows = await journalStore.dealsAll(), legacyItems = [];
       for (const [a, k, d] of rows) {
