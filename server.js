@@ -19,6 +19,7 @@ const crypto = require('crypto');
 const zlib = require('zlib');
 const path = require('path');
 const swingEngine = require('./swing-engine');   // ciclos SWING (módulo puro; subirlo junto a server.js)
+const syncCore = require('./sync-core');         // seq, deals por cuenta+ticket, ventanas de recuperación, cambio de cuenta (subirlo junto a server.js)
 const app = express();
 app.set('trust proxy', 1);
 
@@ -32,6 +33,10 @@ let lastDealCount = 0;
 let lastBalance = 0;
 let lastPositionCount = 0;
 let lastSeq = null;      // último "seq" aceptado de la EA (orden de snapshots)
+// Un seq más de SEQ_FUTURE_MAX_MS adelantado respecto al reloj del servidor es incoherente (reloj del PC roto) y se rechaza
+// para no envenenar lastSeq. Pequeñas diferencias se toleran.
+const SEQ_FUTURE_MAX_MS = (+process.env.SEQ_FUTURE_MAX_MS) || 6 * 3600 * 1000;
+const curAcctKey = () => (accountData && accountData.account && accountData.account.number != null) ? String(accountData.account.number) : '0';
 
 // ── CICLOS SWING (estructura DERIVADA; los datos originales de la EA no se tocan) ────────────────────────
 // El estado (registros por posición, ids de ciclo, contadores, snapshots por sesión, ambigüedades) se guarda aparte
@@ -39,11 +44,22 @@ let lastSeq = null;      // último "seq" aceptado de la EA (orden de snapshots)
 // determinista e idempotente: repetir un sync o reiniciar el servidor no crea ciclos ni duplica importes.
 let swingState = null;
 let swingView = null;
-let swingDirtyAt = 0, swingSaveTimer = null;
-function swingUpdate(snapshot) {
+let swingDirtyAt = 0, swingSaveTimer = null, swingVersion = 0;
+// Referencia del último snapshot recibido (reloj del servidor al recibirlo, UTC observado por la EA) para 'replay' y
+// 'server_reevaluation' cuando el estado persistido aún no tiene state.tm.lastSnap (primer arranque tras la actualización).
+function lastSnapHint() {
+  if (!accountData || !lastUpdate) return null;
+  const srvUtc = Date.parse(lastUpdate) / 1000;
+  if (!Number.isFinite(srvUtc)) return null;
+  const s = accountData.session || {};
+  return { srvUtc, eaUtc: typeof s.utc_obs === 'number' ? s.utc_obs : null, sid: s.id ? String(s.id).replace(/\./g, '-') : null, brokerTs: accountData.timestamp };
+}
+// mode: 'fresh' (snapshot recién recibido de MT5) | 'replay' (snapshot recuperado del almacenamiento al arrancar)
+//       | 'server_reevaluation' (el servidor avanza el reloj sin snapshot nuevo: no crea posiciones, cierres ni deals)
+function swingUpdate(snapshot, mode) {
   try {
-    const r = swingEngine.update(swingState, snapshot, { serverNow: Date.now() / 1000 });
-    swingState = r.state; swingView = r.view;
+    const r = swingEngine.update(swingState, snapshot, { serverNow: Date.now() / 1000, mode: mode || 'fresh', lastSnapHint: lastSnapHint() });
+    swingState = r.state; swingView = r.view; swingVersion++;
     if (r.changed) scheduleSwingSave();
   } catch (e) { console.error('❌ Motor SWING:', e.stack || e.message); }   // un fallo aquí NUNCA debe bloquear /sync
 }
@@ -53,6 +69,39 @@ function scheduleSwingSave() {
     swingSaveTimer = null;
     journalStore.kvSet('swing_state', swingState).catch(e => console.error('❌ No se pudo guardar el estado SWING:', e.message));
   }, 3000);
+}
+// Reevaluación sin snapshot: si el reloj del servidor ya está en una sesión NY posterior a la última resuelta, recalcula
+// con el último estado conocido. Solo avanza la referencia temporal; los datos de cuenta/posiciones/deals son los del último snapshot.
+function maybeReevaluate() {
+  try {
+    if (!swingState || !swingState.tm || !accountData) return false;
+    const key = swingEngine.nySessionKeyUtc(Math.floor(Date.now() / 1000));
+    if (swingState.tm.maxDay && key <= swingState.tm.maxDay) return false;
+    swingUpdate(accountData, 'server_reevaluation');
+    console.log(`🕔 Reevaluación sin snapshot: sesión ${swingView && swingView.nowDay} (estado marcado como no confirmado por MT5)`);
+    return true;
+  } catch (e) { console.error('❌ Reevaluación:', e.message); return false; }
+}
+// Información temporal para el dashboard (se calcula en cada respuesta: la antigüedad cambia con el tiempo)
+function timeInfo() {
+  const now = Date.now() / 1000;
+  const ls = (swingState && swingState.tm && swingState.tm.lastSnap) || lastSnapHint();
+  const age = ls && ls.srvUtc ? Math.max(0, Math.round(now - ls.srvUtc)) : null;
+  const base = (swingView && swingView.time) || {};
+  const stale = age == null || age > swingEngine.CFG.STALE_SECS;
+  return { ...base, serverUtc: Math.round(now), snapshotAge: age, stale, state: stale ? (base.mode === 'fresh' || !base.mode ? 'potentially_stale' : 'last_known') : 'confirmed' };
+}
+const swingKv = { get: k => journalStore.kvGet(k), set: (k, v) => journalStore.kvSet(k, v) };
+// Cambio de cuenta (o primer estado de una cuenta): archiva el estado anterior (verificado por lectura) y restaura el de la cuenta
+// nueva si ya existía; solo si no existe crea uno vacío (con contadores elevados para que los ids no se repitan entre cuentas).
+async function ensureSwingForAccount(acct) {
+  if (!acct || (swingState && (!swingState.account || swingState.account === acct))) return;
+  if (swingSaveTimer) { clearTimeout(swingSaveTimer); swingSaveTimer = null; }
+  const oldAcct = swingState && swingState.account;
+  const r = await syncCore.switchAccountState(swingKv, { state: swingState, snapshotBlob: accountData ? { data: accountData, lastUpdate } : null, oldAcct, newAcct: acct, engine: swingEngine });
+  await journalStore.kvSet('swing_state', r.state);     // el activo se escribe DESPUÉS de verificar el archivo de la cuenta anterior
+  swingState = r.state; swingView = null; lastSeq = null;
+  console.log(`🔀 Cuenta ${oldAcct || '—'} → ${acct}: estado anterior archivado (swing_state:${oldAcct}); ${r.restored ? 'estado restaurado' : 'estado nuevo'}`);
 }
 
 // ── EXCURSIONES DE PRECIO (MAE/MFE en puntos) ─────────────────────────────────
@@ -117,64 +166,106 @@ function notifyClients(reason) {
 }
 
 // ── RECIBE DATOS DEL EA ───────────────────────────────────────────────────────
-app.post('/sync', (req, res) => {
+// Respuesta (siempre JSON): ok, status ('accepted'|'duplicate'|'stale'|'future'), last_seq, deals{accepted,duplicate,rejected,persisted}
+// y dealsync{status,window_ok,frontier,rescan}. Un seq obsoleto/futuro ya NO responde ok:true: la EA no lo toma como sincronizado.
+app.post('/sync', async (req, res) => {
   const token = req.headers['x-token'] || req.body?.token;
   if (token !== SECRET_TOKEN) { // /sync solo lo acepta con el token maestro (la EA)
     return res.status(401).json({ error: 'Token inválido' });
   }
-
-  // Orden: un snapshot con "seq" menor que el último aceptado llegó tarde (reintento viejo) y no pisa el estado actual.
-  // Repetir el mismo seq es un reintento idempotente: el snapshot es el estado completo y simplemente lo reemplaza.
-  const inSeq = req.body?.seq;
-  if (typeof inSeq === 'number' && Number.isFinite(inSeq)) {
-    if (lastSeq !== null && inSeq < lastSeq) {
-      console.log(`⏭️  Sync descartado por antiguo (seq ${inSeq} < ${lastSeq})`);
-      return res.json({ ok: true, stale: true, timestamp: lastUpdate });
+  const body = req.body || {};
+  const acct = body.account && body.account.number != null ? String(body.account.number) : null;
+  const prevSeq = lastSeq;
+  try {
+    // Cambio de cuenta: el seq de otra cuenta no es comparable
+    if (acct && accountData && curAcctKey() !== acct) lastSeq = null;
+    // Orden de snapshots
+    const sq = syncCore.classifySeq(body.seq, lastSeq, Date.now(), SEQ_FUTURE_MAX_MS);
+    if (sq.status === 'stale' || sq.status === 'future') {
+      console.log(`⏭️  Sync rechazado (${sq.status}): seq ${body.seq} · último ${lastSeq}`);
+      lastSeq = prevSeq;
+      // EA antigua (sin ack_v) con seq obsoleto: se conserva la respuesta histórica; las EA nuevas reciben un error explícito.
+      if (sq.status === 'stale' && body.ack_v !== 1) return res.json({ ok: true, stale: true, timestamp: lastUpdate, last_seq: lastSeq });
+      return res.status(409).json({ ok: false, status: sq.status, accepted: false, last_seq: lastSeq, timestamp: lastUpdate });
     }
-    lastSeq = inSeq;
+    if (sq.status === 'duplicate') {
+      return res.json({ ok: true, status: 'duplicate', accepted: false, last_seq: lastSeq, timestamp: lastUpdate });
+    }
+    // Estado Swing de la cuenta correcta ANTES de aplicar nada (si el archivo falla, no se confirma el sync: la EA reintenta)
+    try { await ensureSwingForAccount(acct); }
+    catch (e) { lastSeq = prevSeq; console.error('❌ Cambio de cuenta no completado (nada se sobrescribe):', e.message); return res.status(503).json({ ok: false, status: 'account_switch_failed', accepted: false, last_seq: lastSeq }); }
+    if (sq.status === 'accepted') lastSeq = body.seq;
+
+    // price_exc: validar y fusionar (EA antigua sin este bloque: se conserva lo que ya había)
+    const hadPx = Object.prototype.hasOwnProperty.call(body, 'price_exc');
+    const prevPx = accountData && accountData.price_exc;
+    if (hadPx || prevPx) {
+      const r = mergePriceExc(hadPx ? body.price_exc : null, prevPx);
+      body.price_exc = r.merged;
+      body.price_exc_schema = 1;
+      if (r.bad || r.older) console.log(`ℹ️  price_exc: ${r.ok} aceptadas, ${r.bad} inválidas descartadas, ${r.older} antiguas ignoradas`);
+    }
+
+    // Deals: lote de siempre + lote de recuperación. Se archivan por (cuenta, ticket) y se CONFIRMA lo guardado (acuse).
+    const recovery = Array.isArray(body.recovery_deals) ? body.recovery_deals : [];
+    delete body.recovery_deals;                         // no se persiste en el respaldo del snapshot
+    const ak = acct || curAcctKey();
+    const ing = await ingestDeals(ak, (Array.isArray(body.deals) ? body.deals : []).concat(recovery));
+    let ds = null;
+    if (body.dealsync && typeof body.dealsync === 'object') {
+      // Auditoría DEAL_ENTRY_OUT_BY: la EA informa cuántos hay en el historial (hoy no se envían ni se contabilizan)
+      if (+body.dealsync.outby_n > 0 && outByLogged !== body.dealsync.outby_n) { outByLogged = body.dealsync.outby_n; console.log(`🔎 Auditoría: ${outByLogged} deal(s) DEAL_ENTRY_OUT_BY en el historial de MT5 (no se envían; ver MIGRATION.md §OUT_BY)`); }
+      const st = await getDealSync(ak);
+      if (!ing.dbOk) ds = { status: 'db_pending', window_ok: false, frontier: st.frontier, rescan: false };
+      else {
+        const v = syncCore.verifyWindow(archMap(ak), st.frontier, body.dealsync);
+        ds = { status: v.status, window_ok: v.window_ok, frontier: v.frontier, rescan: !!v.rescan };
+        if (v.status === 'mismatch') { ds.srv_n = v.srv_n; ds.ea_n = v.ea_n; console.log(`⚠️  dealsync: ventana (${body.dealsync.from},${body.dealsync.to}] no coincide — servidor ${v.srv_n} vs EA ${v.ea_n}; la marca NO avanza`); }
+        if (v.rescan) console.log('⚠️  dealsync: el prefijo completo no coincide; se pide re-escaneo desde 0 (idempotente)');
+        if (v.window_ok && v.frontier > st.frontier) { st.frontier = v.frontier; st.updated = new Date().toISOString(); journalStore.kvSet('deal_sync:' + ak, st).catch(e => console.error('❌ deal_sync:', e.message)); }
+      }
+    }
+
+    const newDealCount     = body.deals?.length || 0;
+    const newBalance       = body.account?.balance || 0;
+    const newPositionCount = body.positions?.length || 0;
+
+    accountData = body;
+    lastUpdate  = new Date().toISOString();
+    // El motor recibe los deals del lote + recuperación (accountData no se modifica)
+    swingUpdate(recovery.length ? { ...accountData, deals: (accountData.deals || []).concat(recovery) } : accountData, 'fresh');
+
+    const dealChanged     = newDealCount     !== lastDealCount;
+    const balanceChanged  = Math.abs(newBalance - lastBalance) > 0.01;
+    const positionChanged = newPositionCount !== lastPositionCount;
+
+    let reason = 'sync';
+    if (balanceChanged)  reason = 'balance';
+    if (dealChanged)     reason = 'deal';
+    if (positionChanged) reason = newPositionCount < lastPositionCount ? 'cierre' : 'apertura';
+
+    console.log(`✅ Sync — ${new Date().toLocaleTimeString()} — Deals: ${newDealCount} (+${ing.fresh} nuevos, ${ing.duplicate} ya existían) | Balance: ${newBalance} | Pos: ${newPositionCount} | Motivo: ${reason}`);
+
+    lastDealCount     = newDealCount;
+    lastBalance       = newBalance;
+    lastPositionCount = newPositionCount;
+
+    // Guardar respaldo en la nube (cambios al instante; si no hay cambios, máximo cada 60 s)
+    persistSnapshot(reason);
+
+    // Notificar al dashboard SIEMPRE que el EA envíe datos
+    notifyClients(reason);
+    pushEvaluate().catch(e => console.error('❌ Push:', e.message));   // avisos al teléfono (nunca bloquea /sync)
+
+    const ack = { ok: true, status: 'accepted', accepted: true, timestamp: lastUpdate, last_seq: lastSeq,
+      deals: { accepted: ing.fresh, duplicate: ing.duplicate, rejected: ing.rejected.length, rejected_tickets: ing.rejected.slice(0, 20), persisted: ing.dbOk } };
+    if (ds) ack.dealsync = ds;
+    res.json(ack);
+  } catch (e) {
+    lastSeq = prevSeq;
+    console.error('❌ /sync:', e.stack || e.message);
+    res.status(500).json({ ok: false, status: 'error', accepted: false, last_seq: lastSeq });
   }
-  // price_exc: validar y fusionar (EA antigua sin este bloque: se conserva lo que ya había)
-  const hadPx = req.body && Object.prototype.hasOwnProperty.call(req.body, 'price_exc');
-  const prevPx = accountData && accountData.price_exc;
-  if (req.body && (hadPx || prevPx)) {
-    const r = mergePriceExc(hadPx ? req.body.price_exc : null, prevPx);
-    req.body.price_exc = r.merged;
-    req.body.price_exc_schema = 1;
-    if (r.bad || r.older) console.log(`ℹ️  price_exc: ${r.ok} aceptadas, ${r.bad} inválidas descartadas, ${r.older} antiguas ignoradas`);
-  }
-
-  const newDealCount     = req.body?.deals?.length || 0;
-  const newBalance       = req.body?.account?.balance || 0;
-  const newPositionCount = req.body?.positions?.length || 0;
-
-  accountData = req.body;
-  lastUpdate  = new Date().toISOString();
-  swingUpdate(accountData);   // deriva ciclos SWING del snapshot (no modifica accountData)
-  archiveDeals(accountData.deals);   // acumula deals nuevos en el archivo
-
-  const dealChanged     = newDealCount     !== lastDealCount;
-  const balanceChanged  = Math.abs(newBalance - lastBalance) > 0.01;
-  const positionChanged = newPositionCount !== lastPositionCount;
-
-  let reason = 'sync';
-  if (balanceChanged)  reason = 'balance';
-  if (dealChanged)     reason = 'deal';
-  if (positionChanged) reason = newPositionCount < lastPositionCount ? 'cierre' : 'apertura';
-
-  console.log(`✅ Sync — ${new Date().toLocaleTimeString()} — Deals: ${newDealCount} | Balance: ${newBalance} | Pos: ${newPositionCount} | Motivo: ${reason}`);
-
-  lastDealCount     = newDealCount;
-  lastBalance       = newBalance;
-  lastPositionCount = newPositionCount;
-
-  // Guardar respaldo en la nube (cambios al instante; si no hay cambios, máximo cada 60 s)
-  persistSnapshot(reason);
-
-  // Notificar al dashboard SIEMPRE que el EA envíe datos
-  notifyClients(reason);
-  pushEvaluate().catch(e => console.error('❌ Push:', e.message));   // avisos al teléfono (nunca bloquea /sync)
-
-  res.json({ ok: true, timestamp: lastUpdate });
 });
 
 // ── SIRVE DATOS AL DASHBOARD ──────────────────────────────────────────────────
@@ -186,9 +277,11 @@ app.get('/data', (req, res) => {
   if (!accountData) {
     return res.status(404).json({ error: 'Sin datos aún. Asegúrate que el EA está corriendo.' });
   }
-  const payload = { ...accountData, deals: mergedDeals(), swing: swingView, server_time: lastUpdate };
+  maybeReevaluate();
+  const payload = { ...accountData, deals: mergedDeals(), swing: swingView ? { ...swingView, time: timeInfo() } : null, server_time: lastUpdate };
   if (!/\bgzip\b/.test(String(req.headers['accept-encoding'] || ''))) return res.json(payload);
-  const key = lastUpdate + '|' + dealArchive.size + '|' + (swingView ? 1 : 0);
+  // La clave incluye la versión del estado Swing y una ventana de 15 s (la antigüedad del snapshot cambia con el tiempo)
+  const key = lastUpdate + '|' + archMap(curAcctKey()).size + '|' + swingVersion + '|' + Math.floor(Date.now() / 15000);
   const send = buf => { res.setHeader('Content-Type', 'application/json; charset=utf-8'); res.setHeader('Content-Encoding', 'gzip'); res.setHeader('Vary', 'Accept-Encoding'); res.end(buf); };
   if (dataGzCache.key === key && dataGzCache.buf) return send(dataGzCache.buf);
   zlib.gzip(JSON.stringify(payload), (err, buf) => {
@@ -202,8 +295,9 @@ app.get('/data', (req, res) => {
 app.get('/swing', (req, res) => {
   const token = req.query.token || req.headers['x-token'];
   if (!isAuthorized(token)) return res.status(401).json({ error: 'Token inválido' });
+  maybeReevaluate();
   if (!swingView) return res.status(404).json({ error: 'Aún no hay ciclos calculados.' });
-  res.json(swingView);
+  res.json({ ...swingView, time: timeInfo() });
 });
 
 // ── SSE — PUSH AL DASHBOARD CUANDO HAY CAMBIO ────────────────────────────────
@@ -259,6 +353,9 @@ if (DATABASE_URL) {
       k TEXT PRIMARY KEY, v TEXT NOT NULL, updated TEXT NOT NULL DEFAULT '')`))
     .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_deals (
       ticket TEXT PRIMARY KEY, t BIGINT NOT NULL DEFAULT 0, d TEXT NOT NULL)`))
+    .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_deals_v2 (
+      acct TEXT NOT NULL, ticket TEXT NOT NULL, t BIGINT NOT NULL DEFAULT 0, d TEXT NOT NULL, src TEXT NOT NULL DEFAULT 'ea',
+      PRIMARY KEY (acct, ticket))`))
     .then(() => pool.query(`CREATE TABLE IF NOT EXISTS tl_annotations (
       id TEXT PRIMARY KEY, items TEXT NOT NULL DEFAULT '[]', n INTEGER NOT NULL DEFAULT 0,
       saved TEXT NOT NULL DEFAULT '', updated TEXT NOT NULL DEFAULT '')`))
@@ -322,19 +419,42 @@ if (DATABASE_URL) {
       return rows[0].n;
     },
     // ── Archivo de deals (historial acumulado; la EA solo envía los más recientes) ──
+    // dealsV2 === false (por defecto, hasta que exista kv 'deals_migration'.ok): tabla heredada tl_deals (clave = ticket, sin cuenta).
+    // dealsV2 === true: tabla tl_deals_v2 con clave compuesta (acct, ticket). La tabla heredada NUNCA se modifica ni se borra.
+    dealsV2: false,
+    // Devuelve [[acct, ticket, deal], ...]; acct '' = fila heredada sin cuenta (el servidor la asigna a la cuenta activa en memoria)
     async dealsAll() {
       await ready;
+      if (this.dealsV2) {
+        const { rows } = await pool.query('SELECT acct, ticket, d FROM tl_deals_v2');
+        return rows.map(r => [r.acct, r.ticket, JSON.parse(r.d)]);
+      }
       const { rows } = await pool.query('SELECT ticket, d FROM tl_deals');
-      return rows.map(r => [r.ticket, JSON.parse(r.d)]);
+      return rows.map(r => ['', r.ticket, JSON.parse(r.d)]);
     },
-    async dealsAdd(items) { // items: [[ticket, deal], ...] — solo inserta los que no existen
+    async dealsAdd(acct, items) { // items: [[ticket, deal], ...] — solo inserta los que no existen
       await ready;
       for (let i = 0; i < items.length; i += 1000) {
         const c = items.slice(i, i + 1000);
-        await pool.query(
-          `INSERT INTO tl_deals (ticket, t, d) SELECT * FROM unnest($1::text[], $2::bigint[], $3::text[]) ON CONFLICT (ticket) DO NOTHING`,
-          [c.map(x => x[0]), c.map(x => Math.round(+x[1].time) || 0), c.map(x => JSON.stringify(x[1]))]);
+        if (this.dealsV2)
+          await pool.query(
+            `INSERT INTO tl_deals_v2 (acct, ticket, t, d) SELECT $1, * FROM unnest($2::text[], $3::bigint[], $4::text[]) ON CONFLICT (acct, ticket) DO NOTHING`,
+            [acct, c.map(x => x[0]), c.map(x => Math.round(+x[1].time) || 0), c.map(x => JSON.stringify(x[1]))]);
+        else
+          await pool.query(
+            `INSERT INTO tl_deals (ticket, t, d) SELECT * FROM unnest($1::text[], $2::bigint[], $3::text[]) ON CONFLICT (ticket) DO NOTHING`,
+            [c.map(x => x[0]), c.map(x => Math.round(+x[1].time) || 0), c.map(x => JSON.stringify(x[1]))]);
       }
+    },
+    // Migración aditiva e idempotente tl_deals → tl_deals_v2. Solo copia (INSERT … SELECT … ON CONFLICT DO NOTHING) y verifica conteos.
+    // Las filas heredadas no llevan cuenta: se asignan a `acct` (la cuenta del último snapshot), marcadas src='legacy_assumed'.
+    async migrateDealsV2(acct) {
+      await ready;
+      const n0 = +(await pool.query('SELECT COUNT(*) AS n FROM tl_deals')).rows[0].n;
+      await pool.query(`INSERT INTO tl_deals_v2 (acct, ticket, t, d, src) SELECT $1, ticket, t, d, 'legacy_assumed' FROM tl_deals ON CONFLICT (acct, ticket) DO NOTHING`, [acct]);
+      const n1 = +(await pool.query('SELECT COUNT(*) AS n FROM tl_deals_v2 WHERE acct=$1', [acct])).rows[0].n;
+      const miss = +(await pool.query('SELECT COUNT(*) AS n FROM tl_deals l WHERE NOT EXISTS (SELECT 1 FROM tl_deals_v2 v WHERE v.acct=$1 AND v.ticket=l.ticket)', [acct])).rows[0].n;
+      return { legacy: n0, v2: n1, missing: miss, ok: miss === 0 && n1 >= n0 };
     },
     // ── Anotaciones (dibujos sobre las imágenes): gana la versión con `saved` más reciente ──
     async annGet(id) {
@@ -407,11 +527,18 @@ if (DATABASE_URL) {
         return fs.readdirSync(d).filter(f => f.endsWith('.json') && JSON.parse(fs.readFileSync(path.join(d, f), 'utf8')).day === day).length;
       } catch (_) { return 0; }
     },
-    async dealsAll() { try { return JSON.parse(fs.readFileSync(path.join(dir, 'deals.json'), 'utf8')); } catch (_) { return []; } },
-    async dealsAdd(items) {
-      const cur = new Map(await this.dealsAll());
-      items.forEach(x => { if (!cur.has(x[0])) cur.set(x[0], x[1]); });
-      try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'deals.json'), JSON.stringify([...cur])); } catch (_) {}
+    // Archivo local: deals_v2.json = [[acct, ticket, deal]]. El deals.json heredado se lee (acct '') pero NUNCA se modifica.
+    dealsV2: true,
+    async dealsAll() {
+      let v2 = []; try { v2 = JSON.parse(fs.readFileSync(path.join(dir, 'deals_v2.json'), 'utf8')); } catch (_) {}
+      let legacy = []; try { legacy = JSON.parse(fs.readFileSync(path.join(dir, 'deals.json'), 'utf8')).map(x => ['', x[0], x[1]]); } catch (_) {}
+      return legacy.concat(v2);
+    },
+    async dealsAdd(acct, items) {
+      let cur = []; try { cur = JSON.parse(fs.readFileSync(path.join(dir, 'deals_v2.json'), 'utf8')); } catch (_) {}
+      const have = new Set(cur.map(x => x[0] + '|' + x[1]));
+      items.forEach(x => { if (!have.has(acct + '|' + x[0])) cur.push([acct, x[0], x[1]]); });
+      try { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, 'deals_v2.json'), JSON.stringify(cur)); } catch (_) {}
     },
     // Anotaciones en disco local: NO persistentes en Render sin disco. Solo para pruebas locales.
     async annGet(id) {
@@ -439,30 +566,42 @@ function parseImgs(s) {
 }
 
 // ── ARCHIVO DE DEALS ──────────────────────────────────────────────────────────
-// La EA envía solo los deals más recientes. Aquí se acumulan (clave = ticket, inmutables) para no perder historial.
-// No modifica accountData ni el snapshot: solo se usa para completar la lista de deals que se sirve en /data.
-const dealArchive = new Map();
-let dealWriteChain = Promise.resolve();
-function archiveDeals(deals) {
-  try {
-    if (!Array.isArray(deals)) return;
-    const fresh = [];
-    for (const d of deals) {
-      if (!d || d.ticket == null) continue;
-      const k = String(d.ticket);
-      if (dealArchive.has(k)) continue;
-      dealArchive.set(k, d); fresh.push([k, d]);
+// Se acumulan por (cuenta, ticket) (inmutables) para no perder historial. No modifica accountData ni el snapshot: solo completa
+// la lista de deals que se sirve en /data. Un deal solo entra al Map DESPUÉS de guardarse en la base (el acuse refleja lo guardado).
+const dealArchive = new Map();    // acct → Map(ticket → deal)
+let outByLogged = 0;
+const dealSyncCache = new Map();  // acct → { frontier, updated } (marca de recuperación verificada por el servidor)
+let ingestChain = Promise.resolve();
+function archMap(acct) { let m = dealArchive.get(acct); if (!m) { m = new Map(); dealArchive.set(acct, m); } return m; }
+async function getDealSync(acct) {
+  let st = dealSyncCache.get(acct);
+  if (!st) {
+    let v = null; try { v = await journalStore.kvGet('deal_sync:' + acct); } catch (_) {}
+    st = { frontier: (v && Number.isFinite(+v.frontier)) ? +v.frontier : 0, updated: (v && v.updated) || '' };
+    dealSyncCache.set(acct, st);
+  }
+  return st;
+}
+// Devuelve { fresh, duplicate, rejected[], dbOk }. Los duplicados no vuelven a escribirse ni a contabilizarse.
+function ingestDeals(acct, deals) {
+  const job = ingestChain.then(async () => {
+    const m = archMap(acct);
+    const c = syncCore.classifyDeals(m, deals);
+    let dbOk = true;
+    if (c.fresh.length) {
+      try { await journalStore.dealsAdd(acct, c.fresh); c.fresh.forEach(x => m.set(x[0], x[1])); }
+      catch (e) { dbOk = false; console.error('❌ No se pudo archivar deals (la EA no avanzará su marca; se reenviarán):', e.message); }
     }
-    if (!fresh.length) return;
-    dealWriteChain = dealWriteChain
-      .then(() => journalStore.dealsAdd(fresh))
-      .catch(e => { fresh.forEach(x => dealArchive.delete(x[0])); console.error('❌ No se pudo archivar deals (se reintentará):', e.message); });
-  } catch (e) { console.error('❌ Archivo de deals:', e.message); }
+    return { fresh: dbOk ? c.fresh.length : 0, duplicate: c.duplicate, rejected: c.rejected, dbOk, pending: dbOk ? 0 : c.fresh.length };
+  });
+  ingestChain = job.catch(() => {});
+  return job;
 }
 function mergedDeals() {
   const snap = (accountData && accountData.deals) || [];
-  if (!dealArchive.size) return snap;
-  const m = new Map(dealArchive), extra = [];
+  const arch = archMap(curAcctKey());
+  if (!arch.size) return snap;
+  const m = new Map(arch), extra = [];
   for (const d of snap) { if (d && d.ticket != null) m.set(String(d.ticket), d); else extra.push(d); }
   const n = v => { const x = +v; return Number.isFinite(x) ? x : 0; };
   return [...m.values(), ...extra].sort((a, b) => (n(a.time) - n(b.time)) || (n(a.time_msc) - n(b.time_msc)) || (n(a.ticket) - n(b.ticket)));
@@ -837,12 +976,42 @@ async function loadState() {
       if (typeof accountData.seq === 'number' && Number.isFinite(accountData.seq)) lastSeq = accountData.seq;
       console.log(`📦 Respaldo cargado (${lastUpdate}) — Deals: ${lastDealCount}`);
     }
-    try { (await journalStore.dealsAll()).forEach(x => dealArchive.set(x[0], x[1])); console.log(`🗃️  Archivo de deals: ${dealArchive.size}`); }
-    catch (e) { console.error('❌ Error cargando archivo de deals:', e.message); }
-    if (accountData) archiveDeals(accountData.deals);   // siembra el archivo con el último snapshot guardado
-    // Estado SWING persistido: se recupera y se recalcula la vista con el último snapshot (mismos ids, mismas relaciones)
+    // Archivo de deals por cuenta. Modo v2 (clave compuesta) solo si ya se migró (kv 'deals_migration'.ok); la migración
+    // solo se ejecuta con TL_MIGRATE=1 y NUNCA borra la tabla heredada.
+    const acct0 = accountData && accountData.account && accountData.account.number != null ? String(accountData.account.number) : null;
+    try {
+      let mig = await journalStore.kvGet('deals_migration');
+      if (DATABASE_URL && journalStore.migrateDealsV2 && process.env.TL_MIGRATE === '1' && !(mig && mig.ok)) {
+        if (!acct0) console.error('⛔ TL_MIGRATE=1 pero no hay snapshot con cuenta: migración de tl_deals NO ejecutada.');
+        else {
+          const rep = await journalStore.migrateDealsV2(acct0);
+          console.log('🧭 Migración tl_deals → tl_deals_v2:', JSON.stringify(rep));
+          if (rep.ok) { mig = { ok: true, at: new Date().toISOString(), acct: acct0, ...rep }; await journalStore.kvSet('deals_migration', mig); }
+          else console.error('⛔ Migración incompleta: se sigue usando la tabla heredada tl_deals.');
+        }
+      }
+      if (DATABASE_URL) journalStore.dealsV2 = !!(mig && mig.ok);
+      console.log(`🗃️  Archivo de deals: modo ${journalStore.dealsV2 ? 'v2 (cuenta+ticket)' : 'heredado (solo ticket — sin aislamiento entre cuentas; ver MIGRATION.md)'}`);
+      const rows = await journalStore.dealsAll(), legacyItems = [];
+      for (const [a, k, d] of rows) {
+        const key = a === '' ? (acct0 || '0') : a;
+        archMap(key).set(k, d);
+        if (a === '' && journalStore.dealsV2 && !DATABASE_URL) legacyItems.push([k, d]);   // modo archivo: copia el heredado a deals_v2.json (sin tocar deals.json)
+      }
+      if (legacyItems.length) await journalStore.dealsAdd(acct0 || '0', legacyItems);
+      let tot = 0; for (const m of dealArchive.values()) tot += m.size;
+      console.log(`🗃️  Archivo de deals: ${tot} (${dealArchive.size} cuenta/s)`);
+    } catch (e) { console.error('❌ Error cargando archivo de deals:', e.message); }
+    if (accountData) await ingestDeals(acct0 || '0', accountData.deals).catch(() => {});   // siembra el archivo con el último snapshot guardado
+    // Estado SWING persistido: se recupera tal cual (mismos ids, notas, contadores). Se espeja bajo swing_state:<cuenta> (idempotente)
+    // para poder volver a esta cuenta tras un cambio. Después: REPLAY del último snapshot (con su UTC original, sin actividad nueva)
+    // y REEVALUACIÓN con el reloj del servidor (la sesión puede haber cambiado mientras el servidor estaba apagado).
     swingState = await journalStore.kvGet('swing_state');
-    if (accountData) { swingUpdate(accountData); }
+    if (swingState && swingState.account) {
+      try { if (!(await journalStore.kvGet('swing_state:' + swingState.account))) await syncCore.archiveAccount(swingKv, swingState.account, swingState, accountData ? { data: accountData, lastUpdate } : null); }
+      catch (e) { console.error('⚠️  No se pudo espejar el estado por cuenta:', e.message); }
+    }
+    if (accountData) { swingUpdate(accountData, 'replay'); maybeReevaluate(); }
     console.log(swingView ? `🔗 Ciclos SWING: ${swingView.stats.cycles} (${swingView.stats.active} activos)` : '🔗 Ciclos SWING: sin datos todavía');
     console.log(authCache ? `👤 Usuario configurado: ${authCache.username}` : '👤 Sin usuario creado todavía');
   } catch (e) { console.error('❌ Error cargando estado:', e.message); }
@@ -996,7 +1165,8 @@ function pushTodayRealized(data) {
     ds.sort((a, b) => a.time - b.time);
     const exits = ds.filter(d => d.entry === 'OUT' || d.entry === 'INOUT');
     if (!exits.length || open.has(String(pid))) continue;
-    if (swingEngine.sessionKey(exits[exits.length - 1].time, off) !== today) continue;
+    const tx = exits[exits.length - 1].time;
+    if ((swingState && swingState.tm ? swingEngine.sessionKeyAt(swingState, tx, off) : swingEngine.sessionKey(tx, off)) !== today) continue;
     realized += ds.reduce((a, d) => a + (+d.profit || 0) + (+d.commission || 0) + (+d.swap || 0), 0);
   }
   return { today, realized };
@@ -1035,8 +1205,9 @@ app.get('/status', (req, res) => {
     sse_clients: sseClients.size,
     features: { mt5_capture: true, journal_images: true, annotations: true, images_persistent: !!journalStore.imgPersistent, price_excursions: true, swing_cycles: true, push: true },
     swing_cycles: swingView ? swingView.stats : null,
+    swing_time: swingView ? timeInfo() : null,
     price_exc_count: accountData?.price_exc ? Object.keys(accountData.price_exc).length : 0,
-    version: '1.4.0'
+    version: '1.5.0'
   });
 });
 
@@ -1054,4 +1225,6 @@ app.get('/', (req, res) => {
 
 console.log(`🖼️  Imágenes del journal: rutas activas (${journalStore.imgPersistent ? 'persistentes en Postgres' : '⚠️ disco temporal, NO persistentes'})`);
 const PORT = process.env.PORT || 3000;
+// Reevaluación periódica (sin depender de que MT5 envíe nada): comprueba el cruce de sesión NY con el reloj del servidor
+setInterval(() => { const v = swingVersion; if (maybeReevaluate() && swingVersion !== v) notifyClients('reevaluacion'); }, 15000).unref();
 loadState().finally(() => app.listen(PORT, () => console.log(`🚀 TradeLens Server corriendo en puerto ${PORT}`)));
