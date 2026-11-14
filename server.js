@@ -986,7 +986,11 @@ app.post('/auth/change', async (req, res) => {
 // Cargar usuario y último respaldo de la EA antes de recibir peticiones
 async function loadState() {
   try {
-    authCache = await journalStore.kvGet('auth');
+    // Si la base de datos falla un instante al arrancar, se reintenta: sin usuario cargado todas las sesiones darían 401 y la web las borraría
+    for (let i = 0; i < 5; i++) {
+      try { authCache = await journalStore.kvGet('auth'); break; }
+      catch (e) { if (i === 4) throw e; console.error('⚠️  Reintentando leer el usuario:', e.message); await new Promise(r => setTimeout(r, 2000)); }
+    }
     const snap = await journalStore.kvGet('snapshot');
     if (snap && snap.data && !accountData) {
       accountData = snap.data; lastUpdate = snap.lastUpdate;
