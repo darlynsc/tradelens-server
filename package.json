@@ -1,6 +1,6 @@
 {
   "name": "tradelens-server",
-  "version": "1.2.0",
+  "version": "1.5.0",
   "description": "TradeLens MT5 Analytics Server",
   "main": "server.js",
   "scripts": {
@@ -11,7 +11,6 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "pg": "^8.11.3",
-    "web-push": "^3.6.7"
+    "pg": "^8.11.3"
   }
 }
