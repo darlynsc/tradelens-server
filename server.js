@@ -899,7 +899,8 @@ function checkPw(pw, a) {
 }
 function hmac(p) { return crypto.createHmac('sha256', SESSION_SECRET).update(p).digest('base64url'); }
 function signSession(a) {
-  const p = Buffer.from(JSON.stringify({ u: a.username, pv: a.pv, exp: Date.now() + 90 * 864e5 })).toString('base64url');
+  // Sesión sin caducidad: dura hasta que el usuario pulse «Desconectar» o cambie usuario/contraseña (cambia pv e invalida el token)
+  const p = Buffer.from(JSON.stringify({ u: a.username, pv: a.pv })).toString('base64url');
   return 's1.' + p + '.' + hmac(p);
 }
 function verifySession(t) {
@@ -910,7 +911,7 @@ function verifySession(t) {
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
   try {
     const d = JSON.parse(Buffer.from(p, 'base64url').toString());
-    return d.pv === authCache.pv && d.u === authCache.username && d.exp > Date.now();
+    return d.pv === authCache.pv && d.u === authCache.username;   // sin comprobar 'exp': también mantiene vivas las sesiones antiguas (90 días)
   } catch (_) { return false; }
 }
 function isAuthorized(token) { return token === SECRET_TOKEN || verifySession(token); }
@@ -1038,18 +1039,38 @@ async function loadState() {
 }
 
 // ── NOTIFICACIONES PUSH (Web Push: VAPID + cifrado aes128gcm; usa solo 'crypto' y 'fetch' de Node, sin paquetes nuevos) ──
-// El teléfono/PC se suscribe con /push/subscribe; el servidor evalúa cada /sync de la EA y envía el aviso aunque la app esté cerrada.
-// Las claves VAPID se generan una vez y se guardan junto con las suscripciones en la tabla kv ('push_state').
-const PUSH_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:tradelens@example.com';
+// Cada teléfono/PC se registra UNA vez con /push/subscribe (queda guardado en el servidor con un id de dispositivo propio).
+// El servidor evalúa cada /sync de la EA (y cada cambio de configuración) y envía el aviso a TODOS los dispositivos registrados,
+// aunque la web esté cerrada y la sesión no esté iniciada: el envío NO depende de ningún inicio de sesión.
+// Avisos que genera el servidor: drawdown diario superado · retiro disponible / objetivo alcanzado · subida de nivel de Risk Scaling.
+// Las claves VAPID y los dispositivos se guardan en la tabla kv ('push_state'). Opcional: fijar las claves con las variables de
+// entorno VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY (base64url) para que NUNCA cambien aunque se pierda la base de datos.
+// IMPORTANTE (iPhone/Apple): el "subject" debe ser un mailto: real o una URL https. Por defecto se usa la URL pública de Render.
+const PUSH_SUBJECT = process.env.VAPID_SUBJECT || process.env.RENDER_EXTERNAL_URL || 'mailto:tradelens@example.com';
 let pushState = null, pushLoading = null, pushSaveTimer = null;
 const pushNowUtc = () => Math.floor(Date.now() / 1000);
 
+function pushKeysFromEnv() {
+  const pub = process.env.VAPID_PUBLIC_KEY, d = process.env.VAPID_PRIVATE_KEY;
+  if (!pub || !d) return null;
+  try {
+    const raw = Buffer.from(pub, 'base64url');
+    if (raw.length !== 65 || raw[0] !== 4) return null;
+    const jwk = { kty: 'EC', crv: 'P-256', x: raw.subarray(1, 33).toString('base64url'), y: raw.subarray(33).toString('base64url'), d };
+    crypto.createPrivateKey({ key: jwk, format: 'jwk' });   // valida
+    return { publicKey: pub, privateJwk: jwk };
+  } catch (_) { console.error('❌ VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY no son válidas: se ignoran'); return null; }
+}
 async function pushEnsure() {
   if (pushState) return pushState;
   if (!pushLoading) pushLoading = (async () => {
-    let st = null;
-    try { st = await journalStore.kvGet('push_state'); } catch (_) {}
+    let st = null, loadErr = null;
+    try { st = await journalStore.kvGet('push_state'); } catch (e) { loadErr = e; }
+    const envKeys = pushKeysFromEnv();
+    if (envKeys) { st = st || { subs: {}, cfg: {}, sent: {} }; st.vapid = envKeys; }
     if (!st || !st.vapid || !st.vapid.publicKey || !st.vapid.privateJwk) {
+      // Si la base NO respondió, no se generan claves nuevas (invalidarían todos los dispositivos): se reintenta en el próximo aviso.
+      if (loadErr) { pushLoading = null; throw new Error('No se pudo leer push_state: ' + loadErr.message); }
       const kp = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
       const jwk = kp.privateKey.export({ format: 'jwk' });
       const pub = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]);
@@ -1063,13 +1084,17 @@ async function pushEnsure() {
   })();
   return pushLoading;
 }
-function pushSave() {
+// Guardado casi inmediato (300 ms) + guardado forzado al apagar el servidor (Render envía SIGTERM en cada despliegue/reinicio).
+function pushSave(now) {
+  const run = () => { pushSaveTimer = null; return journalStore.kvSet('push_state', pushState).catch(e => console.error('❌ No se pudo guardar push_state:', e.message)); };
+  if (now) { clearTimeout(pushSaveTimer); return pushState ? run() : Promise.resolve(); }
   if (pushSaveTimer) return;
-  pushSaveTimer = setTimeout(() => {
-    pushSaveTimer = null;
-    journalStore.kvSet('push_state', pushState).catch(e => console.error('❌ No se pudo guardar push_state:', e.message));
-  }, 500);
+  pushSaveTimer = setTimeout(run, 300);
 }
+process.on('SIGTERM', () => {
+  const done = () => process.exit(0);
+  Promise.race([pushSave(true), new Promise(r => setTimeout(r, 2500))]).then(done, done);
+});
 const pushHmac = (k, d) => crypto.createHmac('sha256', k).update(d).digest();
 // RFC 8291 (aes128gcm). opts.asPrivate / opts.salt solo para pruebas con el vector oficial.
 function pushEncrypt(sub, payload, opts) {
@@ -1096,39 +1121,93 @@ function pushVapidJwt(audience) {
   const sig = crypto.sign('sha256', Buffer.from(head + '.' + claims), { key, dsaEncoding: 'ieee-p1363' }).toString('base64url');
   return head + '.' + claims + '.' + sig;
 }
-// Devuelve { status, text }. 404/410 = suscripción muerta.
-async function pushSendOne(sub, payloadObj) {
+// Devuelve { status, text }. 404/410 = suscripción muerta. Cabecera Topic: si el dispositivo estaba apagado, al volver recibe SOLO el último aviso de cada tipo.
+async function pushSendOne(sub, payloadObj, ttl) {
   const body = pushEncrypt(sub, Buffer.from(JSON.stringify(payloadObj)));
   const jwt = pushVapidJwt(new URL(sub.endpoint).origin);
-  const r = await fetch(sub.endpoint, {
-    method: 'POST',
-    headers: { Authorization: `vapid t=${jwt}, k=${pushState.vapid.publicKey}`, 'Content-Encoding': 'aes128gcm',
-      'Content-Type': 'application/octet-stream', TTL: '86400', Urgency: 'high' },
-    body, signal: AbortSignal.timeout(10000)
-  });
+  const headers = { Authorization: `vapid t=${jwt}, k=${pushState.vapid.publicKey}`, 'Content-Encoding': 'aes128gcm',
+    'Content-Type': 'application/octet-stream', TTL: String(ttl || 86400), Urgency: 'high' };
+  const topic = String(payloadObj.tag || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32);
+  if (topic) headers.Topic = topic;
+  const r = await fetch(sub.endpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(10000) });
   let text = ''; if (r.status >= 300) { try { text = (await r.text()).slice(0, 200); } catch (_) {} }
-  return { status: r.status, text };
+  return { status: r.status, text, retryAfter: +r.headers.get('retry-after') || 0 };
 }
-// Envía a todos los dispositivos suscritos. Elimina los que ya no existen.
-async function pushBroadcast(payload) {
-  const st = await pushEnsure();
-  const res = { sent: 0, failed: 0, errors: [] };
-  for (const [ep, rec] of Object.entries(st.subs)) {
+// Un envío con hasta 3 intentos si fue un fallo pasajero (red, 429, 5xx).
+async function pushSendRetry(sub, payload, ttl) {
+  let last = null;
+  for (let i = 0; i < 3; i++) {
     try {
-      const r = await pushSendOne(rec.sub, payload);
-      if (r.status >= 200 && r.status < 300) res.sent++;
+      last = await pushSendOne(sub, payload, ttl);
+      if (last.status < 300 || (last.status < 500 && last.status !== 429)) return last;
+    } catch (e) { last = { status: 0, text: e.message }; }
+    if (i < 2) await new Promise(r => setTimeout(r, last.retryAfter ? Math.min(last.retryAfter, 5) * 1000 : (i + 1) * 1000));
+  }
+  return last;
+}
+const pushDevId = (ep, rec) => (rec && rec.dev && rec.dev.id) || crypto.createHash('sha1').update(ep).digest('hex').slice(0, 12);
+// Envía a todos los dispositivos registrados EN PARALELO y mantiene limpio el registro:
+//  · 404/410 → el dispositivo ya no existe: se borra.
+//  · 400/401/403 repetidos (clave VAPID distinta, suscripción corrupta): se borra tras 3 fallos seguidos (el dispositivo se vuelve a registrar al abrir la web).
+//  · fallos de red/5xx: se conserva, salvo 14 días sin entregar nada.
+async function pushBroadcast(payload, onlyDev) {
+  const st = await pushEnsure();
+  const res = { sent: 0, failed: 0, errors: [], details: [] };
+  const now = Date.now();
+  await Promise.all(Object.entries(st.subs).map(async ([ep, rec]) => {
+    if (onlyDev && pushDevId(ep, rec) !== onlyDev) return;
+    const d = { id: pushDevId(ep, rec), label: (rec.dev && rec.dev.label) || 'Dispositivo', status: 0 };
+    try {
+      const r = await pushSendRetry(rec.sub, payload);
+      d.status = r.status;
+      if (r.status >= 200 && r.status < 300) { res.sent++; rec.ok = now; rec.fail = 0; delete rec.err; }
       else {
         res.failed++; res.errors.push(`${r.status} ${r.text}`.trim());
-        if (r.status === 404 || r.status === 410) { delete st.subs[ep]; pushSave(); }
+        rec.fail = (rec.fail || 0) + 1; rec.err = `${r.status} ${r.text}`.trim().slice(0, 120);
+        if (r.status === 404 || r.status === 410) delete st.subs[ep];
+        else if ((r.status === 400 || r.status === 401 || r.status === 403) && rec.fail >= 3) delete st.subs[ep];
+        else if (rec.fail >= 10 && now - (rec.ok || Date.parse(rec.added) || now) > 14 * 86400000) delete st.subs[ep];
       }
-    } catch (e) { res.failed++; res.errors.push(e.message); }
-  }
+    } catch (e) { res.failed++; res.errors.push(e.message); d.err = e.message; rec.fail = (rec.fail || 0) + 1; }
+    res.details.push(d);
+  }));
+  pushSave();
   return res;
+}
+// Envía un aviso UNA sola vez por evento (slot = tipo de aviso, val = identificador del evento). Si TODOS los envíos fallan, el evento
+// no se da por enviado y se reintenta en el siguiente sync (como mucho cada 60 s).
+const pushRetryAt = {};
+async function pushNotifyOnce(slot, val, payload) {
+  const st = pushState;
+  if (st.sent[slot] === val) return false;
+  const rk = slot + '|' + val;
+  if (pushRetryAt[rk] && Date.now() - pushRetryAt[rk] < 60000) return false;
+  const prev = st.sent[slot];
+  st.sent[slot] = val; pushSave();   // se marca ANTES de esperar: dos /sync seguidos no duplican el aviso
+  const r = await pushBroadcast(payload);
+  console.log(`🔔 Push ${slot}: enviados ${r.sent}, fallidos ${r.failed}${r.errors[0] ? ' (' + r.errors[0] + ')' : ''}`);
+  if (r.sent === 0 && r.failed > 0) { st.sent[slot] = prev; pushRetryAt[rk] = Date.now(); pushSave(); return false; }
+  return r.sent > 0;
 }
 function pushAuth(req, res) {
   const t = req.headers['x-token'] || req.query.token;
   if (!isAuthorized(t)) { res.status(401).json({ error: 'Token inválido' }); return false; }
   return true;
+}
+const pushCleanLabel = v => String(v || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 60);
+function pushValidSub(sub) {
+  return !!(sub && typeof sub.endpoint === 'string' && /^https:\/\//.test(sub.endpoint) && sub.endpoint.length < 1000 && sub.keys && sub.keys.p256dh && sub.keys.auth);
+}
+// Guarda/actualiza un dispositivo. Un mismo dispositivo (devId) tiene UNA sola suscripción vigente: si el navegador la renovó, la vieja se elimina.
+function pushPutSub(st, sub, dev) {
+  const ep = sub.endpoint, prev = st.subs[ep] || {};
+  const id = dev && dev.id ? String(dev.id).replace(/[^A-Za-z0-9-]/g, '').slice(0, 64) : '';
+  if (id) for (const [e2, r2] of Object.entries(st.subs)) if (e2 !== ep && r2.dev && r2.dev.id === id) delete st.subs[e2];
+  st.subs[ep] = {
+    sub: { endpoint: ep, keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) } },
+    dev: { id: id || prev.dev && prev.dev.id || '', label: pushCleanLabel(dev && dev.label) || (prev.dev && prev.dev.label) || 'Dispositivo' },
+    added: prev.added || new Date().toISOString(), seen: new Date().toISOString(), ok: prev.ok || 0, fail: 0
+  };
 }
 app.get('/push/key', async (req, res) => {
   try { const st = await pushEnsure(); res.json({ enabled: true, publicKey: st.vapid.publicKey }); }
@@ -1138,27 +1217,68 @@ app.post('/push/subscribe', async (req, res) => {
   if (!pushAuth(req, res)) return;
   try {
     const sub = req.body && req.body.subscription;
-    if (!sub || typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || !sub.keys || !sub.keys.p256dh || !sub.keys.auth)
-      return res.status(400).json({ error: 'Suscripción inválida.' });
+    if (!pushValidSub(sub)) return res.status(400).json({ error: 'Suscripción inválida.' });
     const st = await pushEnsure();
-    st.subs[sub.endpoint] = { sub: { endpoint: sub.endpoint, keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) } }, added: new Date().toISOString() };
-    pushSave();
-    console.log(`🔔 Push: dispositivo suscrito (${Object.keys(st.subs).length} en total)`);
+    pushPutSub(st, sub, req.body.device);
+    pushSave(true);
+    console.log(`🔔 Push: dispositivo registrado «${st.subs[sub.endpoint].dev.label}» (${Object.keys(st.subs).length} en total)`);
+    pushEvaluate().catch(() => {});
+    res.json({ ok: true, devices: Object.keys(st.subs).length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Renovación automática de la suscripción (la lanza el service worker cuando el navegador la cambia): NO necesita sesión iniciada.
+// Se acepta solo si el dispositivo ya estaba registrado (por su id secreto o por su endpoint anterior).
+app.post('/push/resubscribe', async (req, res) => {
+  try {
+    const b = req.body || {}, sub = b.subscription;
+    if (!pushValidSub(sub)) return res.status(400).json({ error: 'Suscripción inválida.' });
+    const st = await pushEnsure();
+    const devId = String(b.deviceId || '');
+    const known = Object.entries(st.subs).find(([ep, r]) => (b.oldEndpoint && ep === b.oldEndpoint) || (devId.length >= 16 && r.dev && r.dev.id === devId));
+    if (!known) return res.status(404).json({ error: 'Dispositivo desconocido: vuelve a activar las notificaciones desde la web.' });
+    const rec = known[1];
+    pushPutSub(st, sub, { id: rec.dev && rec.dev.id || devId, label: rec.dev && rec.dev.label });
+    if (known[0] !== sub.endpoint) delete st.subs[known[0]];
+    pushSave(true);
+    console.log(`🔔 Push: suscripción renovada «${st.subs[sub.endpoint].dev.label}»`);
     res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/push/devices', async (req, res) => {
+  if (!pushAuth(req, res)) return;
+  try {
+    const st = await pushEnsure();
+    res.json({ ok: true, devices: Object.entries(st.subs).map(([ep, r]) => ({ id: pushDevId(ep, r), label: (r.dev && r.dev.label) || 'Dispositivo',
+      added: r.added, seen: r.seen || null, lastOk: r.ok ? new Date(r.ok).toISOString() : null, failing: (r.fail || 0) > 0, error: r.err || null })) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/push/unsubscribe', async (req, res) => {
   if (!pushAuth(req, res)) return;
-  try { const st = await pushEnsure(); if (req.body && req.body.endpoint) delete st.subs[req.body.endpoint]; pushSave(); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    const st = await pushEnsure(), b = req.body || {};
+    for (const [ep, r] of Object.entries(st.subs)) if ((b.endpoint && ep === b.endpoint) || (b.deviceId && pushDevId(ep, r) === b.deviceId)) delete st.subs[ep];
+    pushSave(true); res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/push/config', async (req, res) => {
   if (!pushAuth(req, res)) return;
   try {
     const st = await pushEnsure(), b = req.body || {}, num = (v, d) => (Number.isFinite(+v) ? +v : d);
+    const w = b.wd && typeof b.wd === 'object' ? b.wd : null;
     st.cfg = { deposit: num(b.deposit, 0), threshold: num(b.threshold, 25), riskPct: num(b.riskPct, 2.5), ddLimitPct: num(b.ddLimitPct, 5),
-      notify: Object.assign({ wd: true, dd: true, coach: true }, b.notify || {}), wd: b.wd || null, updated: new Date().toISOString() };
-    pushSave(); res.json({ ok: true });
+      notify: Object.assign({ wd: true, dd: true, coach: true }, b.notify || {}),
+      wd: w ? { mode: w.mode === 'recuperar' ? 'recuperar' : 'conservador', pct: num(w.pct, 40), startNum: num(w.startNum, 2), goal: w.goal == null ? null : num(w.goal, null),
+        claimed: Array.isArray(w.claimed) ? w.claimed.map(Number).filter(n => n >= 2 && n <= 6) : [], cycleKey: String(w.cycleKey == null ? '0' : w.cycleKey),
+        adj: w.adj && Number.isFinite(+w.adj.amt) ? { amt: +w.adj.amt, base: +w.adj.base } : null } : null,
+      updated: new Date().toISOString() };
+    // Lo que la web ya había avisado en pantalla no se vuelve a notificar por push la primera vez
+    if (w) {
+      const ck = st.cfg.wd.cycleKey;
+      if (w.notifiedSig && st.sent.wd == null) st.sent.wd = ck + '#' + w.notifiedSig;
+      if (+w.goalNotified > 0 && st.sent.goal == null) st.sent.goal = ck + '#goal' + (+w.goalNotified);
+    }
+    pushSave(true); res.json({ ok: true });
+    pushEvaluate().catch(e => console.error('❌ Push:', e.message));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/push/test', async (req, res) => {
@@ -1166,11 +1286,44 @@ app.post('/push/test', async (req, res) => {
   try {
     const st = await pushEnsure();
     if (!Object.keys(st.subs).length) return res.json({ ok: false, error: 'Ningún dispositivo registrado. Desactiva y vuelve a activar las notificaciones.' });
-    const r = await pushBroadcast({ title: 'TradeLens', body: 'Notificación de prueba ✅ Todo funciona.', tag: 'tl-test' });
-    if (r.sent > 0) return res.json({ ok: true, sent: r.sent, failed: r.failed });
-    res.json({ ok: false, error: 'El servicio de notificaciones rechazó el envío: ' + (r.errors[0] || 'sin detalle') });
+    const r = await pushBroadcast({ title: 'TradeLens', body: 'Notificación de prueba ✅ Todo funciona.', tag: 'tl-test', kind: 'test' });
+    const devices = r.details.map(d => ({ label: d.label, ok: d.status >= 200 && d.status < 300, status: d.status }));
+    if (r.sent > 0) return res.json({ ok: true, sent: r.sent, failed: r.failed, devices });
+    res.json({ ok: false, error: 'El servicio de notificaciones rechazó el envío: ' + (r.errors[0] || 'sin detalle'), devices });
   } catch (e) { res.json({ ok: false, error: e.message }); }
 });
+
+// ── Cálculos de Risk Scaling / Plan de retiro (idénticos a los del dashboard) ──
+function pushLevels(deposit, thresholdPct, riskPct) {
+  const f = 1 + thresholdPct / 100, L = []; let t = deposit;
+  for (let i = 0; i < 6; i++) { L.push({ num: i + 1, target: +t.toFixed(2), riskAmt: +(t * riskPct / 100).toFixed(2) }); t *= f; }
+  return L;
+}
+function pushActiveIdx(levels, balance) {
+  for (let i = levels.length - 1; i >= 0; i--) if (balance >= levels[i].target) return i;
+  return 0;
+}
+function pushWdCompute(levels, balance, st) {   // st = {mode, pct, startNum, claimed:[{num}]}
+  const f = st.pct / 100;
+  const info = levels.map((l, i) => {
+    if (i === 0) return null;
+    const w = +((l.target - levels[i - 1].target) * f).toFixed(2);
+    return { num: l.num, w, claimed: st.claimed.find(c => c.num === l.num) || null };
+  });
+  const granted = []; let sum = 0;
+  if (st.mode === 'conservador') {
+    for (const x of info) {
+      if (!x || x.claimed || x.num < st.startNum) continue;
+      if (balance - (sum + x.w) >= levels[x.num - 1].target - 1e-6) { granted.push(x); sum += x.w; }
+      else break;
+    }
+  }
+  return { info, granted, sum: +sum.toFixed(2) };
+}
+const pushMoney = (acc, n) => {
+  const c = String((acc && acc.currency) || 'USD').toUpperCase(), sym = { USD: '$', EUR: '€', GBP: '£' }[c] || (c + ' ');
+  return sym + Number(n).toLocaleString('en', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
 
 // Pérdida del día vs límite de drawdown (misma fórmula que el dashboard). Un aviso por sesión NY.
 function pushTodayRealized(data) {
@@ -1191,27 +1344,73 @@ function pushTodayRealized(data) {
   }
   return { today, realized };
 }
+// Evalúa TODOS los avisos con los datos más recientes de la EA. Se llama en cada /sync y al cambiar la configuración.
+// Cada aviso se envía una sola vez por evento (ver pushNotifyOnce) y cada bloque va aislado: si uno falla no frena a los demás.
 async function pushEvaluate() {
   const st = await pushEnsure();
   if (!accountData || !Object.keys(st.subs).length) return;
-  const cfg = st.cfg || {}, notify = cfg.notify || { dd: true };
+  const cfg = st.cfg || {}, notify = Object.assign({ wd: true, dd: true, coach: true }, cfg.notify || {});
   const acc = accountData.account || {};
-  if (notify.dd !== false && acc.balance) {
-    const { today, realized } = pushTodayRealized(accountData);
-    const limitPct = cfg.ddLimitPct > 0 ? cfg.ddLimitPct : 5;
-    const base = acc.balance - realized, limit = base * limitPct / 100;
-    const realLoss = realized < 0 ? -realized : 0;
-    const used = acc.equity != null ? Math.max(0, base - acc.equity) : realLoss;
-    const key = 'dd:' + today;
-    if (base > 0 && used >= limit && !st.sent[key]) {
-      st.sent[key] = Date.now();
-      for (const k of Object.keys(st.sent)) if (k.startsWith('dd:') && k !== key) delete st.sent[k];
-      pushSave();
-      const r = await pushBroadcast({ title: 'TradeLens — Drawdown diario superado ⚠️',
-        body: `Pérdida del día: -$${used.toFixed(2)} (${(used / base * 100).toFixed(2)}%) · Límite ${limitPct}% = $${limit.toFixed(2)}`, tag: 'tl-dd' });
-      console.log(`🔔 Push drawdown: enviados ${r.sent}, fallidos ${r.failed}`);
+  const bal = Number(acc.balance);
+
+  // 1 · Drawdown diario (un aviso por sesión NY)
+  try {
+    if (notify.dd !== false && bal) {
+      const { today, realized } = pushTodayRealized(accountData);
+      const limitPct = cfg.ddLimitPct > 0 ? cfg.ddLimitPct : 5;
+      const base = bal - realized, limit = base * limitPct / 100;
+      const realLoss = realized < 0 ? -realized : 0;
+      const used = realLoss;   // solo pérdida REALIZADA: la EA envía el equity únicamente por eventos, no en tiempo real
+      if (st.sent['dd:' + today]) { st.sent.dd = today; delete st.sent['dd:' + today]; }   // migración del formato anterior
+      if (base > 0 && used >= limit) {
+        await pushNotifyOnce('dd', today, { title: 'TradeLens — Drawdown diario superado ⚠️', tag: 'tl-dd', kind: 'dd',
+          body: `Pérdida del día: -${pushMoney(acc, used)} (${(used / base * 100).toFixed(2)}%) · Límite ${limitPct}% = ${pushMoney(acc, limit)}` });
+      }
     }
-  }
+  } catch (e) { console.error('❌ Push dd:', e.message); }
+
+  // 2 · Subida de nivel de Risk Scaling (el primer cálculo solo fija el punto de partida, sin avisar)
+  try {
+    if (notify.coach !== false && bal > 0 && cfg.updated) {
+      const deposit = cfg.deposit > 0 ? cfg.deposit : 1000, thr = cfg.threshold > 0 ? cfg.threshold : 25, rp = cfg.riskPct > 0 ? cfg.riskPct : 2.5;
+      const levels = pushLevels(deposit, thr, rp), idx = pushActiveIdx(levels, bal), sig = deposit + '|' + thr + '|' + rp;
+      const L = st.lvl;
+      if (!L || L.sig !== sig) { st.lvl = { sig, idx }; pushSave(); }
+      else if (idx < L.idx) { L.idx = idx; pushSave(); }
+      else if (idx > L.idx) {
+        const rk = 'lvl|' + sig + '|' + idx;
+        if (!(pushRetryAt[rk] && Date.now() - pushRetryAt[rk] < 60000)) {
+          const prev = L.idx; L.idx = idx; pushSave();
+          const cur = levels[idx];
+          const r = await pushBroadcast({ title: `TradeLens — ¡Subiste al Nivel ${idx + 1}!`, tag: 'tl-coach-lvl', kind: 'level',
+            body: `Tu balance alcanzó ${pushMoney(acc, bal)}. Nuevo riesgo por trade: ${pushMoney(acc, cur.riskAmt)} (${rp}% de ${pushMoney(acc, cur.target)}). Actualiza tu lot size en MT5.` });
+          console.log(`🔔 Push nivel ${idx + 1}: enviados ${r.sent}, fallidos ${r.failed}`);
+          if (r.sent === 0 && r.failed > 0) { L.idx = prev; pushRetryAt[rk] = Date.now(); pushSave(); }
+        }
+      }
+    }
+  } catch (e) { console.error('❌ Push nivel:', e.message); }
+
+  // 3 · Plan de retiro: retiro disponible (modo conservador) u objetivo alcanzado (modo recuperar)
+  try {
+    const w = cfg.wd;
+    if (notify.wd !== false && w && bal > 0) {
+      const deposit = cfg.deposit > 0 ? cfg.deposit : 1000, thr = cfg.threshold > 0 ? cfg.threshold : 25;
+      const levels = pushLevels(deposit, thr, 1);
+      let eff = bal;
+      if (w.adj && Math.abs(bal - w.adj.base) < 0.005) eff = bal - w.adj.amt;
+      const conservador = w.mode !== 'recuperar', ck = String(w.cycleKey || '0');
+      const res = pushWdCompute(levels, eff, { mode: w.mode, pct: w.pct > 0 ? w.pct : 40, startNum: w.startNum || 2, claimed: (w.claimed || []).map(n => ({ num: +n })) });
+      if (conservador && res.granted.length) {
+        const sig = ck + '#' + res.granted.map(x => x.num + ':' + x.w).join('|');
+        await pushNotifyOnce('wd', sig, { title: 'TradeLens — Retiro disponible', tag: 'tl-wd', kind: 'wd',
+          body: `¡Lograste el umbral de retiro! Ya puedes retirar ${pushMoney(acc, res.sum)} de tu cuenta.` });
+      } else if (!conservador && w.goal >= 2 && w.goal <= 6 && bal >= levels[w.goal - 1].target) {
+        await pushNotifyOnce('goal', ck + '#goal' + w.goal, { title: 'TradeLens — Objetivo alcanzado', tag: 'tl-wd', kind: 'wd',
+          body: `Tu cuenta llegó al Nivel ${w.goal} (${pushMoney(acc, levels[w.goal - 1].target)}).` });
+      }
+    }
+  } catch (e) { console.error('❌ Push retiro:', e.message); }
 }
 
 // ── STATUS ────────────────────────────────────────────────────────────────────
