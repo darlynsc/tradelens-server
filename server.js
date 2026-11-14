@@ -1154,10 +1154,16 @@ const pushDevId = (ep, rec) => (rec && rec.dev && rec.dev.id) || crypto.createHa
 //  · 404/410 → el dispositivo ya no existe: se borra.
 //  · 400/401/403 repetidos (clave VAPID distinta, suscripción corrupta): se borra tras 3 fallos seguidos (el dispositivo se vuelve a registrar al abrir la web).
 //  · fallos de red/5xx: se conserva, salvo 14 días sin entregar nada.
+const pushRecentDk = {};   // dk → instante del último envío: evita que el aviso del servidor y el retransmitido por la web lleguen dos veces
 async function pushBroadcast(payload, onlyDev) {
   const st = await pushEnsure();
   const res = { sent: 0, failed: 0, errors: [], details: [] };
   const now = Date.now();
+  const dk = payload && payload.dk && !onlyDev ? String(payload.dk) : '';
+  if (dk) {
+    if (pushRecentDk[dk] && now - pushRecentDk[dk] < 180000) { res.skipped = true; return res; }
+    pushRecentDk[dk] = now;   // se marca ya (antes de esperar): dos envíos simultáneos del mismo aviso no se duplican
+  }
   await Promise.all(Object.entries(st.subs).map(async ([ep, rec]) => {
     if (onlyDev && pushDevId(ep, rec) !== onlyDev) return;
     const d = { id: pushDevId(ep, rec), label: (rec.dev && rec.dev.label) || 'Dispositivo', status: 0 };
@@ -1175,6 +1181,7 @@ async function pushBroadcast(payload, onlyDev) {
     } catch (e) { res.failed++; res.errors.push(e.message); d.err = e.message; rec.fail = (rec.fail || 0) + 1; }
     res.details.push(d);
   }));
+  if (dk && res.sent === 0) delete pushRecentDk[dk];   // nadie lo recibió: se podrá reintentar
   pushSave();
   return res;
 }
@@ -1285,6 +1292,23 @@ app.post('/push/config', async (req, res) => {
     pushEvaluate().catch(e => console.error('❌ Push:', e.message));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Retransmisión: cualquier dispositivo conectado que genere un aviso lo manda aquí y el servidor lo envía a TODOS los dispositivos
+// registrados, incluido el que lo generó.
+app.post('/push/relay', async (req, res) => {
+  if (!pushAuth(req, res)) return;
+  try {
+    const st = await pushEnsure(), b = req.body || {};
+    const clean = (v, n) => String(v || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, n);
+    const title = clean(b.title, 120), body = clean(b.body, 400);
+    if (!title && !body) return res.status(400).json({ error: 'Aviso vacío.' });
+    if (!Object.keys(st.subs).length) return res.json({ ok: false, error: 'Ningún dispositivo registrado.' });
+    const payload = { title: title || 'TradeLens', body, tag: clean(b.tag, 40) || 'tradelens', kind: clean(b.kind, 20) || 'relay' };
+    const dk = clean(b.dk, 40); if (dk) payload.dk = dk;
+    const r = await pushBroadcast(payload);
+    console.log(`🔔 Push retransmitido (${payload.kind}): enviados ${r.sent}, fallidos ${r.failed}${r.skipped ? ' (ya enviado por el servidor)' : ''}`);
+    res.json({ ok: true, sent: r.sent, failed: r.failed, skipped: !!r.skipped });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.post('/push/test', async (req, res) => {
   if (!pushAuth(req, res)) return;
   try {
@@ -1386,7 +1410,7 @@ async function pushEvaluate() {
         if (!(pushRetryAt[rk] && Date.now() - pushRetryAt[rk] < 60000)) {
           const prev = L.idx; L.idx = idx; pushSave();
           const cur = levels[idx];
-          const r = await pushBroadcast({ title: `TradeLens — ¡Subiste al Nivel ${idx + 1}!`, tag: 'tl-coach-lvl', kind: 'level',
+          const r = await pushBroadcast({ title: `TradeLens — ¡Subiste al Nivel ${idx + 1}!`, tag: 'tl-coach-lvl', kind: 'level', dk: 'level',
             body: `Tu balance alcanzó ${pushMoney(acc, bal)}. Nuevo riesgo por trade: ${pushMoney(acc, cur.riskAmt)} (${rp}% de ${pushMoney(acc, cur.target)}). Actualiza tu lot size en MT5.` });
           console.log(`🔔 Push nivel ${idx + 1}: enviados ${r.sent}, fallidos ${r.failed}`);
           if (r.sent === 0 && r.failed > 0) { L.idx = prev; pushRetryAt[rk] = Date.now(); pushSave(); }
@@ -1407,10 +1431,10 @@ async function pushEvaluate() {
       const res = pushWdCompute(levels, eff, { mode: w.mode, pct: w.pct > 0 ? w.pct : 40, startNum: w.startNum || 2, claimed: (w.claimed || []).map(n => ({ num: +n })) });
       if (conservador && res.granted.length) {
         const sig = ck + '#' + res.granted.map(x => x.num + ':' + x.w).join('|');
-        await pushNotifyOnce('wd', sig, { title: 'TradeLens — Retiro disponible', tag: 'tl-wd', kind: 'wd',
+        await pushNotifyOnce('wd', sig, { title: 'TradeLens — Retiro disponible', tag: 'tl-wd', kind: 'wd', dk: 'wd',
           body: `¡Lograste el umbral de retiro! Ya puedes retirar ${pushMoney(acc, res.sum)} de tu cuenta.` });
       } else if (!conservador && w.goal >= 2 && w.goal <= 6 && bal >= levels[w.goal - 1].target) {
-        await pushNotifyOnce('goal', ck + '#goal' + w.goal, { title: 'TradeLens — Objetivo alcanzado', tag: 'tl-wd', kind: 'wd',
+        await pushNotifyOnce('goal', ck + '#goal' + w.goal, { title: 'TradeLens — Objetivo alcanzado', tag: 'tl-wd', kind: 'wd', dk: 'goal',
           body: `Tu cuenta llegó al Nivel ${w.goal} (${pushMoney(acc, levels[w.goal - 1].target)}).` });
       }
     }
