@@ -1154,6 +1154,9 @@ const pushDevId = (ep, rec) => (rec && rec.dev && rec.dev.id) || crypto.createHa
 //  · 404/410 → el dispositivo ya no existe: se borra.
 //  · 400/401/403 repetidos (clave VAPID distinta, suscripción corrupta): se borra tras 3 fallos seguidos (el dispositivo se vuelve a registrar al abrir la web).
 //  · fallos de red/5xx: se conserva, salvo 14 días sin entregar nada.
+function pushLogEvt(p, r) {   // últimos avisos procesados (visibles en Notificaciones): permite ver si un aviso se envió, falló u omitió
+  try { const st = pushState; st.log = st.log || []; st.log.unshift({ t: new Date().toISOString(), kind: (p && p.kind) || '', tag: (p && p.tag) || '', sent: r.sent, failed: r.failed, skipped: !!r.skipped }); st.log.length = Math.min(st.log.length, 15); } catch (_) {}
+}
 const pushRecentDk = {};   // dk → instante del último envío: evita que el aviso del servidor y el retransmitido por la web lleguen dos veces
 async function pushBroadcast(payload, onlyDev) {
   const st = await pushEnsure();
@@ -1161,7 +1164,7 @@ async function pushBroadcast(payload, onlyDev) {
   const now = Date.now();
   const dk = payload && payload.dk && !onlyDev ? String(payload.dk) : '';
   if (dk) {
-    if (pushRecentDk[dk] && now - pushRecentDk[dk] < 180000) { res.skipped = true; return res; }
+    if (pushRecentDk[dk] && now - pushRecentDk[dk] < 30000) { res.skipped = true; pushLogEvt(payload, res); return res; }
     pushRecentDk[dk] = now;   // se marca ya (antes de esperar): dos envíos simultáneos del mismo aviso no se duplican
   }
   await Promise.all(Object.entries(st.subs).map(async ([ep, rec]) => {
@@ -1182,6 +1185,7 @@ async function pushBroadcast(payload, onlyDev) {
     res.details.push(d);
   }));
   if (dk && res.sent === 0) delete pushRecentDk[dk];   // nadie lo recibió: se podrá reintentar
+  pushLogEvt(payload, res);
   pushSave();
   return res;
 }
@@ -1259,7 +1263,7 @@ app.get('/push/devices', async (req, res) => {
   if (!pushAuth(req, res)) return;
   try {
     const st = await pushEnsure();
-    res.json({ ok: true, devices: Object.entries(st.subs).map(([ep, r]) => ({ id: pushDevId(ep, r), label: (r.dev && r.dev.label) || 'Dispositivo',
+    res.json({ ok: true, log: st.log || [], dd: (st.dbg && st.dbg.dd) || null, devices: Object.entries(st.subs).map(([ep, r]) => ({ id: pushDevId(ep, r), label: (r.dev && r.dev.label) || 'Dispositivo',
       added: r.added, seen: r.seen || null, lastOk: r.ok ? new Date(r.ok).toISOString() : null, failing: (r.fail || 0) > 0, error: r.err || null })) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1306,7 +1310,8 @@ app.post('/push/relay', async (req, res) => {
     const dk = clean(b.dk, 40); if (dk) payload.dk = dk;
     const r = await pushBroadcast(payload);
     console.log(`🔔 Push retransmitido (${payload.kind}): enviados ${r.sent}, fallidos ${r.failed}${r.skipped ? ' (ya enviado por el servidor)' : ''}`);
-    res.json({ ok: true, sent: r.sent, failed: r.failed, skipped: !!r.skipped });
+    res.json({ ok: true, sent: r.sent, failed: r.failed, skipped: !!r.skipped, total: Object.keys(st.subs).length,
+      devices: r.details.map(d => ({ label: d.label, ok: d.status >= 200 && d.status < 300, status: d.status, err: d.err || null })) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/push/test', async (req, res) => {
@@ -1316,7 +1321,7 @@ app.post('/push/test', async (req, res) => {
     if (!Object.keys(st.subs).length) return res.json({ ok: false, error: 'Ningún dispositivo registrado. Desactiva y vuelve a activar las notificaciones.' });
     const r = await pushBroadcast({ title: 'TradeLens', body: 'Notificación de prueba ✅ Todo funciona.', tag: 'tl-test', kind: 'test' });
     const devices = r.details.map(d => ({ label: d.label, ok: d.status >= 200 && d.status < 300, status: d.status }));
-    if (r.sent > 0) return res.json({ ok: true, sent: r.sent, failed: r.failed, devices });
+    if (r.sent > 0) return res.json({ ok: true, sent: r.sent, failed: r.failed, total: Object.keys(st.subs).length, devices });
     res.json({ ok: false, error: 'El servicio de notificaciones rechazó el envío: ' + (r.errors[0] || 'sin detalle'), devices });
   } catch (e) { res.json({ ok: false, error: e.message }); }
 });
@@ -1389,6 +1394,7 @@ async function pushEvaluate() {
       const base = bal - realized, limit = base * limitPct / 100;
       const realLoss = realized < 0 ? -realized : 0;
       const used = realLoss;   // solo pérdida REALIZADA: la EA envía el equity únicamente por eventos, no en tiempo real
+      (st.dbg = st.dbg || {}).dd = { at: new Date().toISOString(), today, used: +used.toFixed(2), limit: +limit.toFixed(2), base: +base.toFixed(2), limitPct };
       if (st.sent['dd:' + today]) { st.sent.dd = today; delete st.sent['dd:' + today]; }   // migración del formato anterior
       if (base > 0 && used >= limit) {
         await pushNotifyOnce('dd', today, { title: 'TradeLens — Drawdown diario superado ⚠️', tag: 'tl-dd', kind: 'dd',
@@ -1474,4 +1480,6 @@ console.log(`🖼️  Imágenes del journal: rutas activas (${journalStore.imgPe
 const PORT = process.env.PORT || 3000;
 // Reevaluación periódica (sin depender de que MT5 envíe nada): comprueba el cruce de sesión NY con el reloj del servidor
 setInterval(() => { const v = swingVersion; if (maybeReevaluate() && swingVersion !== v) notifyClients('reevaluacion'); }, 15000).unref();
+// Reevaluación de avisos push cada 60 s: reintenta los envíos fallidos aunque la EA no envíe nada (es idempotente: cada evento se avisa una sola vez)
+setInterval(() => { if (pushState && Object.keys(pushState.subs).length) pushEvaluate().catch(e => console.error('❌ Push (reintento):', e.message)); }, 60000).unref();
 loadState().finally(() => app.listen(PORT, () => console.log(`🚀 TradeLens Server corriendo en puerto ${PORT}`)));
